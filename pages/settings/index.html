@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>百分之一小作文生成器 - 黑名单管理</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>🚫 黑名单管理</h1>
+    <p class="subtitle">管理已关闭小作文功能的群聊和私聊</p>
+
+    <div class="sections">
+      <!-- 群聊黑名单 -->
+      <div class="section">
+        <h2>💬 群聊黑名单</h2>
+        <div class="add-form">
+          <input type="text" id="group-input" placeholder="输入群号" />
+          <button id="group-add-btn" onclick="addItem('group')">添加</button>
+        </div>
+        <ul id="group-list" class="blacklist-list">
+          <li class="empty-hint">暂无群聊黑名单</li>
+        </ul>
+      </div>
+
+      <!-- 私聊黑名单 -->
+      <div class="section">
+        <h2>👤 私聊黑名单</h2>
+        <div class="add-form">
+          <input type="text" id="private-input" placeholder="输入QQ号" />
+          <button id="private-add-btn" onclick="addItem('private')">添加</button>
+        </div>
+        <ul id="private-list" class="blacklist-list">
+          <li class="empty-hint">暂无私聊黑名单</li>
+        </ul>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
