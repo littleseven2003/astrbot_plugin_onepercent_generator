@@ -11,9 +11,12 @@ from astrbot.api.star import Context, Star, register
 
 from ai_client import AIClient
 from blacklist import (
+    add_to_blacklist as bl_add,
     disable_session,
     enable_session,
+    get_blacklist,
     is_enabled,
+    remove_from_blacklist as bl_remove,
 )
 from post_process import build_final_message
 from prompt import build_main_prompt
@@ -68,6 +71,9 @@ class OnePercentGenerator(Star):
         self.default_enabled = self.config.get("default_enabled", True)
 
         logger.info("百分之一小作文生成器插件已加载")
+
+        # 注册 Web API（用于黑名单管理页面）
+        self._register_web_apis()
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查是否为管理员"""
@@ -250,6 +256,77 @@ class OnePercentGenerator(Star):
         else:
             yield event.plain_result(f"❌ {result['message']}")
         event.stop_event()
+
+    # ========================================================================
+    # Web API：黑名单管理
+    # ========================================================================
+
+    def _register_web_apis(self):
+        """注册黑名单管理 Web API"""
+        try:
+            self.context.register_web_api(
+                "/astrbot_plugin_onepercent_generator/blacklist/get",
+                self._api_get_blacklist,
+                ["GET"],
+                "获取黑名单列表",
+            )
+            self.context.register_web_api(
+                "/astrbot_plugin_onepercent_generator/blacklist/add",
+                self._api_add_blacklist,
+                ["POST"],
+                "添加黑名单",
+            )
+            self.context.register_web_api(
+                "/astrbot_plugin_onepercent_generator/blacklist/remove",
+                self._api_remove_blacklist,
+                ["POST"],
+                "移除黑名单",
+            )
+            logger.info("黑名单管理 Web API 注册成功")
+        except (AttributeError, TypeError) as e:
+            logger.warning(f"Web API 注册不支持，黑名单管理仅可通过指令操作: {e}")
+
+    async def _api_get_blacklist(self, request):
+        """GET: 获取黑名单列表"""
+        import json
+        from aiohttp import web
+
+        bl = await get_blacklist(self.context)
+        return web.json_response(bl)
+
+    async def _api_add_blacklist(self, request):
+        """POST: 添加黑名单"""
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+            target_id = str(data.get("target_id", "")).strip()
+            target_type = data.get("target_type", "group")
+
+            if not target_id:
+                return web.json_response({"message": "请输入有效的ID"}, status=400)
+
+            result = await bl_add(target_id, target_type, self.context)
+            return web.json_response({"message": result})
+        except Exception as e:
+            return web.json_response({"message": f"操作失败: {e}"}, status=500)
+
+    async def _api_remove_blacklist(self, request):
+        """POST: 移除黑名单"""
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+            target_id = str(data.get("target_id", "")).strip()
+            target_type = data.get("target_type", "group")
+
+            if not target_id:
+                return web.json_response({"message": "请输入有效的ID"}, status=400)
+
+            result = await bl_remove(target_id, target_type, self.context)
+            return web.json_response({"message": result})
+        except Exception as e:
+            return web.json_response({"message": f"操作失败: {e}"}, status=500)
 
     # ========================================================================
     # 生命周期

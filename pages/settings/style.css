@@ -1,4 +1,4 @@
-/* 百分之一小作文生成器 - WebUI 黑名单管理样式 */
+/* 黑名单管理页面样式 */
 
 * {
   margin: 0;
@@ -8,195 +8,147 @@
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  background: #f5f7fa;
-  color: #1a1a2e;
-  line-height: 1.6;
-  min-height: 100vh;
-  padding: 2rem 1rem;
+  background: #f5f5f5;
+  color: #333;
+  padding: 20px;
 }
 
 .container {
-  max-width: 720px;
+  max-width: 800px;
   margin: 0 auto;
 }
 
 h1 {
-  font-size: 1.5rem;
-  font-weight: 700;
-  margin-bottom: 0.25rem;
-}
-
-.subtitle {
-  color: #64748b;
-  font-size: 0.9rem;
-  margin-bottom: 1.5rem;
-}
-
-.sections {
-  display: flex;
-  flex-direction: column;
-  gap: 1.5rem;
+  font-size: 24px;
+  margin-bottom: 24px;
+  color: #1a1a1a;
 }
 
 .section {
   background: #fff;
-  border-radius: 12px;
-  padding: 1.25rem;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-.section h2 {
-  font-size: 1.1rem;
-  font-weight: 600;
-  margin-bottom: 1rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid #e5e7eb;
+.section h3 {
+  font-size: 16px;
+  margin-bottom: 16px;
+  color: #444;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 8px;
 }
 
-/* 添加表单 */
 .add-form {
   display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
+  gap: 8px;
+  margin-bottom: 16px;
 }
 
 .add-form input {
   flex: 1;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  font-size: 0.9rem;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 14px;
   outline: none;
   transition: border-color 0.2s;
 }
 
 .add-form input:focus {
-  border-color: #6366f1;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+  border-color: #4a90d9;
 }
 
 .add-form button {
-  padding: 0.5rem 1rem;
-  background: #6366f1;
+  padding: 8px 16px;
+  background: #4a90d9;
   color: #fff;
   border: none;
-  border-radius: 8px;
-  font-size: 0.9rem;
-  font-weight: 500;
+  border-radius: 6px;
+  font-size: 14px;
   cursor: pointer;
   transition: background 0.2s;
   white-space: nowrap;
 }
 
 .add-form button:hover {
-  background: #4f46e5;
+  background: #357abd;
 }
 
-/* 列表 */
 .blacklist-list {
   list-style: none;
 }
 
 .blacklist-list li {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  padding: 0.6rem 0.75rem;
-  border-radius: 8px;
-  transition: background 0.15s;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 14px;
 }
 
-.blacklist-list li:not(:last-child) {
-  margin-bottom: 0.25rem;
+.blacklist-list li:last-child {
+  border-bottom: none;
 }
 
-.blacklist-list li:hover {
-  background: #f8fafc;
+.blacklist-list li span {
+  color: #555;
 }
 
-.blacklist-list .item-id {
-  font-size: 0.9rem;
-  color: #334155;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.btn-remove {
-  padding: 0.3rem 0.75rem;
-  background: transparent;
-  color: #ef4444;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  font-size: 0.8rem;
+.blacklist-list li button {
+  padding: 4px 12px;
+  background: #e74c3c;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: background 0.2s;
 }
 
-.btn-remove:hover {
-  background: #fef2f2;
-  border-color: #ef4444;
+.blacklist-list li button:hover {
+  background: #c0392b;
 }
 
-.empty-hint {
-  color: #94a3b8;
-  font-size: 0.85rem;
+.empty-tip {
+  color: #999;
+  font-size: 13px;
+  padding: 12px 0;
   text-align: center;
-  padding: 1rem 0;
 }
 
-/* Toast */
-.toast {
+.status-msg {
   position: fixed;
-  bottom: 2rem;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 0.75rem 1.5rem;
-  border-radius: 10px;
-  font-size: 0.9rem;
-  font-weight: 500;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  transition: opacity 0.3s, transform 0.3s;
+  top: 20px;
+  right: 20px;
+  padding: 12px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  color: #fff;
   z-index: 1000;
-}
-
-.toast.hidden {
   opacity: 0;
-  transform: translateX(-50%) translateY(1rem);
+  transform: translateY(-10px);
+  transition: all 0.3s;
   pointer-events: none;
 }
 
-.toast.success {
-  background: #ecfdf5;
-  color: #065f46;
-  border: 1px solid #a7f3d0;
+.status-msg.show {
+  opacity: 1;
+  transform: translateY(0);
 }
 
-.toast.error {
-  background: #fef2f2;
-  color: #991b1b;
-  border: 1px solid #fecaca;
+.status-msg.success {
+  background: #27ae60;
 }
 
-.toast.info {
-  background: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
+.status-msg.error {
+  background: #e74c3c;
 }
 
-/* 响应式 */
-@media (max-width: 480px) {
-  body {
-    padding: 1rem 0.5rem;
-  }
-
-  h1 {
-    font-size: 1.25rem;
-  }
-
-  .add-form {
-    flex-direction: column;
-  }
-
-  .add-form button {
-    width: 100%;
-  }
+.loading {
+  text-align: center;
+  padding: 20px;
+  color: #999;
 }
