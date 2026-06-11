@@ -1,14 +1,10 @@
-# ✍️ 百分之一小作文生成器
+# ✍️ AstrBot Onepercent Generator
 
 基于 [AstrBot](https://github.com/Soulter/AstrBot) 框架开发的 AstrBot 插件 —— 在 QQ 聊天中通过关键词触发，自动生成符合 [TapTap《百分之一》](https://www.taptap.cn/moment/371075389700702390) 活动格式的游戏推荐帖。
 
 <div align="center">
 
-[![GitHub Stars](https://img.shields.io/github/stars/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&logo=github&label=Stars)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator)
-[![GitHub Forks](https://img.shields.io/github/forks/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&logo=github&label=Forks)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator)
-[![GitHub Issues](https://img.shields.io/github/issues/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&logo=github&label=Issues)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/issues)
-[![GitHub License](https://img.shields.io/github/license/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&logo=github&label=License)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&logo=github&label=Release)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Moe Counter](https://count.getloli.com/get/@astrbot_plugin_onepercent_generator?theme=moebooru)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator)
 
 </div>
 
