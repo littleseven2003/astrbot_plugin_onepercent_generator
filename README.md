@@ -4,11 +4,6 @@
 
 <div align="center">
 
-[![Stars](https://img.shields.io/github/stars/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/stargazers)
-[![Forks](https://img.shields.io/github/forks/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/network/members)
-[![Issues](https://img.shields.io/github/issues/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/issues)
-[![Pull Requests](https://img.shields.io/github/issues-pr/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/pulls)
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
 [![Release](https://img.shields.io/badge/Release-v0.1.0-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
