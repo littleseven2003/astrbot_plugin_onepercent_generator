@@ -29,7 +29,7 @@ from .search_service import SearchService
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.1.0",
+    "0.1.1",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
