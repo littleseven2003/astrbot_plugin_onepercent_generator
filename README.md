@@ -55,6 +55,40 @@ AstrBot 插件 —— 在 QQ 聊天中通过关键词触发，自动生成符合
 3. 配置 AI 模型参数（Base URL、API Key、Model）
 4. 配置管理员 QQ 号
 
+## 输出示例
+
+```
+什么是【我的百分之一】见帖子说明：https://www.taptap.cn/moment/371075389700702390
+
+游戏名称：原神
+发售平台：PC / PS4 / PS5 / iOS / Android
+游玩时间：断断续续玩了一年多
+推荐人群：喜欢开放世界探索和二次元风格的玩家
+
+原神是一款开放世界冒险游戏，你将扮演"旅行者"在提瓦特大陆上展开冒险。游戏的美术风格非常独特，每个地区都有不同的文化氛围，从蒙德的欧式风情到璃月的中式韵味，再到稻妻的日式美学，每一处都让人流连忘返。
+
+我是开服玩家，最开始被游戏的美术和音乐吸引，后来沉迷于各种角色的故事线。记得第一次抽到五星角色时的兴奋，还有和朋友一起刷副本的快乐。虽然有时候会吐槽体力不够用，但每次新版本更新都会忍不住回归探索。
+
+如果你喜欢探索、收集和剧情，原神绝对值得一试。
+```
+
+## 项目结构
+
+```
+├── main.py                # 插件主入口
+├── prompt.py              # Prompt 模板组装
+├── post_process.py        # AI 响应后处理
+├── ai_client.py           # AI API 调用封装
+├── search_service.py      # 联网搜索服务
+├── rate_limiter.py        # 频率限制
+├── blacklist.py           # 黑名单管理
+├── metadata.yaml          # 插件元数据
+├── _conf_schema.json      # 配置 Schema
+├── requirements.txt       # Python 依赖
+├── pages/settings/        # WebUI 黑名单管理页面
+└── docs/                  # 项目文档
+```
+
 ## 详细设计
 
 详见 [docs/Design.md](docs/Design.md)
