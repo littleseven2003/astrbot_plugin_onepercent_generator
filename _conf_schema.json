@@ -71,9 +71,16 @@
       }
     }
   },
-  "default_enabled": {
-    "description": "默认是否启用（新群聊/私聊）",
-    "type": "bool",
-    "default": true
+  "whitelist_groups": {
+    "description": "白名单群聊列表",
+    "type": "list",
+    "hint": "留空表示所有群聊均可使用。填写群号后，仅这些群聊可使用小作文功能",
+    "default": []
+  },
+  "whitelist_privates": {
+    "description": "白名单私聊列表",
+    "type": "list",
+    "hint": "留空表示所有私聊均可使用。填写QQ号后，仅这些私聊可使用小作文功能",
+    "default": []
   }
 }

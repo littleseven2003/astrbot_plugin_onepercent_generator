@@ -5,7 +5,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Release](https://img.shields.io/badge/Release-v0.1.4-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.1.5-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
@@ -19,9 +19,8 @@
 * 🔍 **联网搜索**：自动搜索游戏公开资料（Bing → 百度多源 fallback），让 AI 生成更贴合实际的内容
 * ✅ **格式一致**：完全复现原项目 Prompt 与后处理逻辑，游戏名由程序拼装不经过 AI
 * ⏱️ **频率限制**：基于 QQ 号的滑动窗口 + 每日上限双重限制，防止滥用
-* 🚫 **黑名单管理**：管理员可针对特定群聊/私聊开启或关闭功能
-* 🖥️ **WebUI 管理**：通过 AstrBot 插件管理页面可视化管理黑名单
-* 🔧 **模型兼容**：兼容 OpenAI 格式 API（DeepSeek / OpenAI / 通义千问等），支持 Mock 模式
+* 📋 **白名单控制**：可配置白名单群聊/私聊列表，精准控制功能使用范围
+* 🔧 **模型兼容**：兼容 OpenAI 格式 API（DeepSeek / OpenAI / 通义千问等）
 
 ---
 
@@ -110,13 +109,6 @@ pip install httpx
 <details>
 <summary><b>🔐 管理员指令 (点击展开)</b></summary>
 
-### 功能控制
-
-| 指令 | 说明 |
-| :--- | :--- |
-| `/开启小作文功能` | 为当前群聊/私聊开启小作文功能（从黑名单移除） |
-| `/关闭小作文功能` | 为当前群聊/私聊关闭小作文功能（加入黑名单） |
-
 ### 测试指令
 
 | 指令 | 说明 |
@@ -124,7 +116,7 @@ pip install httpx
 | `/小作文模型测试` | 测试当前 AI 模型服务是否可用（不受频率限制） |
 | `/小作文搜索测试 游戏名` | 测试联网搜索功能（默认测试「原神」） |
 
-> 💡 以上指令仅配置的管理员 QQ 号可使用。
+> 💡 以上指令仅配置的管理员 QQ 号可使用。管理员不受白名单和频率限制。
 
 </details>
 
@@ -145,7 +137,8 @@ pip install httpx
 | 每日最大请求次数 | 整数 | 每 QQ 号每日限制 | `20` |
 | 是否启用联网搜索 | 布尔 | 是否搜索游戏资料 | `true` |
 | 搜索超时时间 | 整数 | 搜索超时（毫秒） | `8000` |
-| 默认是否启用 | 布尔 | 新群聊/私聊的默认状态 | `true` |
+| 白名单群聊列表 | 列表 | 留空=全部允许，填写群号后仅这些群可用 | 空 |
+| 白名单私聊列表 | 列表 | 留空=全部允许，填写QQ号后仅这些私聊可用 | 空 |
 
 ### 频率限制说明
 
@@ -167,13 +160,12 @@ pip install httpx
 ├── ai_client.py               # AI API 调用封装（兼容 OpenAI 格式）
 ├── search_service.py          # 联网搜索服务（Bing / 百度）
 ├── rate_limiter.py            # 频率限制逻辑
-├── blacklist.py               # 黑名单管理逻辑
+├── whitelist.py               # 白名单管理逻辑
 ├── metadata.yaml              # 插件元数据
 ├── _conf_schema.json          # 配置 Schema（WebUI 配置页）
 ├── requirements.txt           # Python 依赖
 ├── LICENSE                    # MIT 开源协议
 ├── README.md                  # 说明文档
-├── pages/settings/            # WebUI 黑名单管理页面
 └── docs/                      # 项目文档
     ├── Design.md              # 详细设计文档
     └── CHANGELOG.md           # 更新日志
