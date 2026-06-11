@@ -9,7 +9,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .ai_client import AIClient
+from .ai_client import AIClient, AIClientError
 from .blacklist import (
     add_to_blacklist as bl_add,
     disable_session,
@@ -29,7 +29,7 @@ from .search_service import SearchService
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.1.3",
+    "0.1.4",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -171,9 +171,9 @@ class OnePercentGenerator(Star):
         # 调用 AI
         try:
             ai_response = await self.ai_client.generate(prompt)
-        except Exception as e:
-            logger.error(f"AI 调用失败: {e}")
-            yield event.plain_result("❌ 生成失败，请稍后重试")
+        except AIClientError as e:
+            logger.error(f"[小作文生成器] AI 调用失败: {e}")
+            yield event.plain_result(e.user_message)
             event.stop_event()
             return
 

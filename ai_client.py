@@ -1,9 +1,10 @@
 """
 AI API 调用模块
-封装 OpenAI 格式的 API 调用，支持 Mock 模式
+封装 OpenAI 格式的 API 调用
 """
 
 import logging
+
 import httpx
 
 from .prompt import SYSTEM_PROMPT
@@ -15,16 +16,25 @@ TEMPERATURE = 0.8
 MAX_TOKENS = 2048
 TIMEOUT_SECONDS = 120
 
-# Mock 响应示例
-MOCK_RESPONSE = """发售平台：PC / Switch / iOS / Android
-游玩时间：断断续续玩了两年多
-推荐人群：喜欢种田养老、温馨治愈风格的玩家
 
-星露谷物语是一款像素风格的模拟经营游戏，你继承了爷爷留下的农场，从零开始打理一切。种地、钓鱼、挖矿、社交，每天都有做不完的事情，但节奏却出奇地让人放松。
+class AIClientError(Exception):
+    """AI 客户端错误基类"""
 
-我是被朋友安利入坑的，一开始觉得画面有点简陋，结果一玩就停不下来。最让我印象深刻的是和村民们的互动，每个人都有自己的故事，慢慢解锁他们的剧情线特别有成就感。冬天的时候窝在农场里整理仓库，听着背景音乐，感觉整个世界都安静下来了。
+    def __init__(self, message: str, user_message: str = ""):
+        super().__init__(message)
+        self.user_message = user_message or message
 
-如果你想找个能玩很久又不会太累的游戏，星露谷物语绝对值得一试。"""
+
+class AIClientNotConfigured(AIClientError):
+    """未配置 AI 模型信息"""
+
+
+class AIClientTimeout(AIClientError):
+    """请求超时"""
+
+
+class AIClientAPIError(AIClientError):
+    """API 返回错误"""
 
 
 class AIClient:
@@ -38,7 +48,7 @@ class AIClient:
 
     @property
     def is_configured(self) -> bool:
-        """是否已配置 API Key"""
+        """是否已配置 API Key 和 Base URL"""
         return bool(self.api_key and self.base_url)
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -57,11 +67,18 @@ class AIClient:
             AI 生成的文本内容
 
         Raises:
-            Exception: API 调用失败时抛出异常
+            AIClientNotConfigured: 未配置模型信息
+            AIClientTimeout: 请求超时
+            AIClientAPIError: API 返回错误
+            AIClientError: 其他调用错误
         """
         if not self.is_configured:
-            logger.warning("AI API 未配置，使用 Mock 模式")
-            return MOCK_RESPONSE
+            msg = "未配置 AI 模型信息（Base URL 或 API Key 为空）"
+            logger.error(f"[小作文生成器] {msg}")
+            raise AIClientNotConfigured(
+                msg,
+                "❌ 小作文功能未配置 AI 模型，请在插件配置页面填写 API Base URL 和 API Key",
+            )
 
         client = await self._get_client()
         url = f"{self.base_url}/chat/completions"
@@ -79,15 +96,52 @@ class AIClient:
             "max_tokens": MAX_TOKENS,
         }
 
-        logger.info(f"调用 AI API: {self.model} @ {self.base_url}")
+        logger.info(f"[小作文生成器] 调用 AI API: {self.model} @ {self.base_url}")
 
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
-        content = data["choices"][0]["message"]["content"]
-        logger.info(f"AI 响应长度: {len(content)} 字符")
-        return content
+            content = data["choices"][0]["message"]["content"]
+            logger.info(f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符")
+            return content
+
+        except httpx.TimeoutException:
+            msg = f"AI 请求超时（{TIMEOUT_SECONDS}s）: {self.model} @ {self.base_url}"
+            logger.error(f"[小作文生成器] {msg}")
+            raise AIClientTimeout(
+                msg,
+                f"❌ AI 生成超时（{TIMEOUT_SECONDS}秒），请稍后重试",
+            )
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            msg = f"AI API 返回 HTTP {status}: {self.model} @ {self.base_url}"
+            logger.error(f"[小作文生成器] {msg}")
+            detail = ""
+            if status == 401:
+                detail = "API Key 无效，请检查配置"
+            elif status == 403:
+                detail = "API 访问被拒绝，请检查 API Key 权限"
+            elif status == 429:
+                detail = "API 请求频率超限，请稍后重试"
+            elif status >= 500:
+                detail = "AI 服务端异常，请稍后重试"
+            else:
+                detail = f"HTTP {status} 错误"
+            raise AIClientAPIError(
+                msg,
+                f"❌ AI 调用失败：{detail}",
+            )
+
+        except Exception as e:
+            msg = f"AI 调用异常: {type(e).__name__}: {e}"
+            logger.error(f"[小作文生成器] {msg}")
+            raise AIClientError(
+                msg,
+                f"❌ AI 生成失败：{str(e)}",
+            )
 
     async def test_connection(self) -> dict:
         """
