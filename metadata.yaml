@@ -1,6 +1,6 @@
 name: astrbot_plugin_onepercent_generator
 desc: 百分之一小作文生成器 - 在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖
-version: 0.1.2
+version: 0.1.3
 author: littleseven2003
 repo: https://github.com/littleseven2003/astrbot_plugin_onepercent_generator
 keywords:

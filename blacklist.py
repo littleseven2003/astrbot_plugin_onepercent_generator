@@ -19,7 +19,7 @@ async def get_blacklist(kv_storage) -> dict:
     Returns:
         {"groups": [str], "privates": [str]}
     """
-    data = await kv_storage.get_kv_data(BLACKLIST_KEY)
+    data = await kv_storage.get_kv_data(BLACKLIST_KEY, None)
     if data is None:
         return _default_blacklist()
     if isinstance(data, str):

@@ -56,7 +56,7 @@ class RateLimiter:
         today = _get_today_str()
 
         # 读取现有记录
-        record = await kv_storage.get_kv_data(key)
+        record = await kv_storage.get_kv_data(key, None)
         if record is None:
             record = {
                 "window_start": now,
