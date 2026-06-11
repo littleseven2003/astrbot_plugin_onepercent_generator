@@ -1,0 +1,79 @@
+{
+  "admin_qqs": {
+    "description": "管理员QQ号列表",
+    "type": "list",
+    "hint": "输入管理员的QQ号，支持多个",
+    "default": []
+  },
+  "ai_config": {
+    "description": "AI 模型配置",
+    "type": "object",
+    "items": {
+      "base_url": {
+        "description": "API Base URL",
+        "type": "string",
+        "hint": "例如：https://api.deepseek.com/v1"
+      },
+      "api_key": {
+        "description": "API Key",
+        "type": "string",
+        "hint": "输入你的 API Key",
+        "obvious_hint": true
+      },
+      "model": {
+        "description": "模型名称",
+        "type": "string",
+        "default": "deepseek-chat",
+        "hint": "例如：deepseek-chat、gpt-3.5-turbo"
+      }
+    }
+  },
+  "rate_limit": {
+    "description": "频率限制配置",
+    "type": "object",
+    "items": {
+      "window_minutes": {
+        "description": "限制时间窗口（分钟）",
+        "type": "int",
+        "default": 10
+      },
+      "max_requests_per_window": {
+        "description": "窗口内最大请求次数（基于QQ号全局限制）",
+        "type": "int",
+        "default": 3
+      },
+      "daily_max": {
+        "description": "每日最大请求次数（基于QQ号全局限制）",
+        "type": "int",
+        "default": 20
+      }
+    }
+  },
+  "preset_games": {
+    "description": "预设游戏列表",
+    "type": "list",
+    "hint": "输入游戏名称，支持多个（每行一个）",
+    "default": ["原神", "星露谷物语", "艾尔登法环", "塞尔达传说：王国之泪", "博德之门3"]
+  },
+  "search_config": {
+    "description": "联网搜索配置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否启用联网搜索",
+        "type": "bool",
+        "default": true
+      },
+      "timeout_ms": {
+        "description": "搜索超时时间（毫秒）",
+        "type": "int",
+        "default": 8000
+      }
+    }
+  },
+  "default_enabled": {
+    "description": "默认是否启用（新群聊/私聊）",
+    "type": "bool",
+    "default": true
+  }
+}
