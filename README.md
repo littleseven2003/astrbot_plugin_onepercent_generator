@@ -4,7 +4,15 @@
 
 <div align="center">
 
-[![Moe Counter](https://count.getloli.com/get/@astrbot_plugin_onepercent_generator?theme=moebooru)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator)
+[![GitHub Stars](https://img.shields.io/github/stars/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/issues)
+[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/littleseven2003/astrbot_plugin_onepercent_generator?style=social)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/pulls)
+
+[![License](https://img.shields.io/github/license/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&color=blue)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
+[![Release](https://img.shields.io/github/v/release/littleseven2003/astrbot_plugin_onepercent_generator?style=flat&color=green)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
 </div>
 
