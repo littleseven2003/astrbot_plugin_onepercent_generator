@@ -9,8 +9,8 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from ai_client import AIClient
-from blacklist import (
+from .ai_client import AIClient
+from .blacklist import (
     add_to_blacklist as bl_add,
     disable_session,
     enable_session,
@@ -18,10 +18,10 @@ from blacklist import (
     is_enabled,
     remove_from_blacklist as bl_remove,
 )
-from post_process import build_final_message
-from prompt import build_main_prompt
-from rate_limiter import RateLimiter
-from search_service import SearchService
+from .post_process import build_final_message
+from .prompt import build_main_prompt
+from .rate_limiter import RateLimiter
+from .search_service import SearchService
 
 
 @register(

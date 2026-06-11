@@ -6,7 +6,7 @@ AI API 调用模块
 import logging
 import httpx
 
-from prompt import SYSTEM_PROMPT
+from .prompt import SYSTEM_PROMPT
 
 logger = logging.getLogger("astrbot")
 
