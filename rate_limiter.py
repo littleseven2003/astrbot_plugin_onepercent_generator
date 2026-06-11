@@ -56,7 +56,7 @@ class RateLimiter:
         today = _get_today_str()
 
         # 读取现有记录
-        record = await kv_storage.get(key)
+        record = await kv_storage.get_kv_data(key)
         if record is None:
             record = {
                 "window_start": now,
@@ -112,6 +112,6 @@ class RateLimiter:
 
         # 保存记录
         import json
-        await kv_storage.set(key, json.dumps(record))
+        await kv_storage.put_kv_data(key, json.dumps(record))
 
         return {"allowed": True, "message": ""}

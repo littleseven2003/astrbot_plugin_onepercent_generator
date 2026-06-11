@@ -19,7 +19,7 @@ async def get_blacklist(kv_storage) -> dict:
     Returns:
         {"groups": [str], "privates": [str]}
     """
-    data = await kv_storage.get(BLACKLIST_KEY)
+    data = await kv_storage.get_kv_data(BLACKLIST_KEY)
     if data is None:
         return _default_blacklist()
     if isinstance(data, str):
@@ -36,7 +36,7 @@ async def get_blacklist(kv_storage) -> dict:
 async def save_blacklist(kv_storage, blacklist: dict):
     """保存黑名单"""
     import json
-    await kv_storage.set(BLACKLIST_KEY, json.dumps(blacklist))
+    await kv_storage.put_kv_data(BLACKLIST_KEY, json.dumps(blacklist))
 
 
 async def is_enabled(session_id: str, session_type: str, default_enabled: bool, kv_storage) -> bool:

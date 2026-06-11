@@ -29,7 +29,7 @@ from .search_service import SearchService
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.1.1",
+    "0.1.2",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -139,7 +139,7 @@ class OnePercentGenerator(Star):
         session_id, session_type = self._get_session_info(event)
 
         # 检查功能是否启用
-        if not await is_enabled(session_id, session_type, self.default_enabled, self.context):
+        if not await is_enabled(session_id, session_type, self.default_enabled, self):
             yield event.plain_result("🚫 当前会话的小作文功能已关闭")
             event.stop_event()
             return
@@ -147,7 +147,7 @@ class OnePercentGenerator(Star):
         # 检查频率限制（管理员不受限制）
         sender_id = event.get_sender_id()
         if sender_id not in self.admin_qqs:
-            rate_check = await self.rate_limiter.check_and_record(sender_id, self.context)
+            rate_check = await self.rate_limiter.check_and_record(sender_id, self)
             if not rate_check["allowed"]:
                 yield event.plain_result(rate_check["message"])
                 event.stop_event()
@@ -195,7 +195,7 @@ class OnePercentGenerator(Star):
             return
 
         session_id, session_type = self._get_session_info(event)
-        msg = await enable_session(session_id, session_type, self.context)
+        msg = await enable_session(session_id, session_type, self)
         yield event.plain_result(msg)
         event.stop_event()
 
@@ -208,7 +208,7 @@ class OnePercentGenerator(Star):
             return
 
         session_id, session_type = self._get_session_info(event)
-        msg = await disable_session(session_id, session_type, self.context)
+        msg = await disable_session(session_id, session_type, self)
         yield event.plain_result(msg)
         event.stop_event()
 
@@ -291,7 +291,7 @@ class OnePercentGenerator(Star):
         import json
         from aiohttp import web
 
-        bl = await get_blacklist(self.context)
+        bl = await get_blacklist(self)
         return web.json_response(bl)
 
     async def _api_add_blacklist(self, request):
@@ -306,7 +306,7 @@ class OnePercentGenerator(Star):
             if not target_id:
                 return web.json_response({"message": "请输入有效的ID"}, status=400)
 
-            result = await bl_add(target_id, target_type, self.context)
+            result = await bl_add(target_id, target_type, self)
             return web.json_response({"message": result})
         except Exception as e:
             return web.json_response({"message": f"操作失败: {e}"}, status=500)
@@ -323,7 +323,7 @@ class OnePercentGenerator(Star):
             if not target_id:
                 return web.json_response({"message": "请输入有效的ID"}, status=400)
 
-            result = await bl_remove(target_id, target_type, self.context)
+            result = await bl_remove(target_id, target_type, self)
             return web.json_response({"message": result})
         except Exception as e:
             return web.json_response({"message": f"操作失败: {e}"}, status=500)

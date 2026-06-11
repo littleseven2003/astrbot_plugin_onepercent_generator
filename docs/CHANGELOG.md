@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.1.2 - 2026-06-11
+
+### 修复
+
+- 修复 KV 存储调用方式，使用 `Star` 基类的 `get_kv_data` / `put_kv_data` 方法，解决 `AttributeError: 'Context' object has no attribute 'get'`
+
 ## v0.1.1 - 2026-06-11
 
 ### 修复
