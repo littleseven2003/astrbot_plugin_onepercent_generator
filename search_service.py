@@ -99,19 +99,19 @@ def _build_search_digest(game_name: str, texts: list[str], max_length: int = 200
     # 收集所有句子
     all_sentences = []
     for text in texts:
-        # 按中文句号、感叹号、问号、分号拆分
-        parts = re.split(r'[。！？；\n]', text)
+        # 按多种标点和换行拆分
+        parts = re.split(r'[。！？；\n.!?;,，；]', text)
         for part in parts:
             part = part.strip()
             # 过滤太短或无意义的片段
-            if len(part) >= 8:
+            if len(part) >= 4:
                 all_sentences.append(part)
 
-    # 去重（基于前15字符）
+    # 去重（基于前10字符）
     seen = set()
     unique_sentences = []
     for s in all_sentences:
-        key = s[:15]
+        key = s[:10]
         if key not in seen:
             seen.add(key)
             unique_sentences.append(s)
@@ -120,12 +120,17 @@ def _build_search_digest(game_name: str, texts: list[str], max_length: int = 200
     result_parts = []
     total_len = 0
     for s in unique_sentences:
-        if total_len + len(s) + 1 > max_length:
+        sentence = s[:60] + ("..." if len(s) > 60 else "")
+        if total_len + len(sentence) + 1 > max_length:
             break
-        result_parts.append(s)
-        total_len += len(s) + 1
+        result_parts.append(sentence)
+        total_len += len(sentence) + 1
 
     if not result_parts:
+        # 兜底：直接截取原始文本
+        for text in texts:
+            if text:
+                return text[:max_length] + ("..." if len(text) > max_length else "")
         return ""
 
     return "；".join(result_parts) + "。"
