@@ -1,5 +1,20 @@
 # 更新日志
 
+## v0.2.1 - 2026-06-11
+
+### 新增
+
+- 插件配置页新增「生成后发送统计信息」开关（默认开启），可关闭生成信息的发送
+
+## v0.2.0 - 2026-06-11
+
+### 新增
+
+- 每次生成结束后追加返回本次生成信息：调用者、游戏模式、模型、耗时、Token 消耗、搜索服务商、搜索耗时、搜索结果摘要、用户限制状态
+- `ai_client.generate()` 返回值改为 dict，包含 content / model / duration_ms / token_usage
+- `search_service.search_game_info()` 返回值新增 provider / duration_ms / result_titles
+- `rate_limiter` 新增 `get_usage_status()` 方法查询用户当前使用情况
+
 ## v0.1.5 - 2026-06-11
 
 ### 变更

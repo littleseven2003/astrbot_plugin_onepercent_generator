@@ -4,6 +4,7 @@ AI API 调用模块
 """
 
 import logging
+import time
 
 import httpx
 
@@ -56,7 +57,7 @@ class AIClient:
             self._client = httpx.AsyncClient(timeout=TIMEOUT_SECONDS)
         return self._client
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str) -> dict:
         """
         调用 AI 生成内容
 
@@ -64,7 +65,16 @@ class AIClient:
             prompt: 用户 prompt（由 build_main_prompt 生成）
 
         Returns:
-            AI 生成的文本内容
+            {
+                "content": str,       # AI 生成的文本
+                "model": str,         # 模型名称
+                "duration_ms": int,   # 生成耗时（毫秒）
+                "token_usage": {      # token 消耗
+                    "prompt_tokens": int,
+                    "completion_tokens": int,
+                    "total_tokens": int,
+                }
+            }
 
         Raises:
             AIClientNotConfigured: 未配置模型信息
@@ -97,6 +107,7 @@ class AIClient:
         }
 
         logger.info(f"[小作文生成器] 调用 AI API: {self.model} @ {self.base_url}")
+        start_time = time.time()
 
         try:
             resp = await client.post(url, json=payload, headers=headers)
@@ -104,8 +115,26 @@ class AIClient:
             data = resp.json()
 
             content = data["choices"][0]["message"]["content"]
-            logger.info(f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符")
-            return content
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # 提取 token 用量
+            usage = data.get("usage", {})
+            token_usage = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+
+            logger.info(
+                f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符，"
+                f"耗时: {duration_ms}ms，tokens: {token_usage['total_tokens']}"
+            )
+            return {
+                "content": content,
+                "model": self.model,
+                "duration_ms": duration_ms,
+                "token_usage": token_usage,
+            }
 
         except httpx.TimeoutException:
             msg = f"AI 请求超时（{TIMEOUT_SECONDS}s）: {self.model} @ {self.base_url}"

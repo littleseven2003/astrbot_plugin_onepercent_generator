@@ -82,5 +82,11 @@
     "type": "list",
     "hint": "留空表示所有私聊均可使用。填写QQ号后，仅这些私聊可使用小作文功能",
     "default": []
+  },
+  "show_generation_stats": {
+    "description": "生成后发送统计信息",
+    "type": "bool",
+    "hint": "开启后每次生成小作文后会额外发送一条生成信息（模型、耗时、Token、搜索等）",
+    "default": true
   }
 }

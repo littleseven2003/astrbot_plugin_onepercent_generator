@@ -6,6 +6,7 @@
 import logging
 import random
 import re
+import time
 from html.parser import HTMLParser
 
 import httpx
@@ -191,19 +192,31 @@ class SearchService:
             {
                 "status": "success" | "partial" | "failed" | "disabled",
                 "summary": "搜索结果摘要",
+                "provider": "Bing" | "百度" | "未启用" | "失败",
+                "duration_ms": int,
+                "result_titles": ["标题1", "标题2", ...],
             }
         """
         if not self.enabled:
-            return {"status": "disabled", "summary": ""}
+            return {
+                "status": "disabled", "summary": "",
+                "provider": "未启用", "duration_ms": 0, "result_titles": [],
+            }
 
         query = f"{game_name} 游戏介绍 平台 评价"
+        start_time = time.time()
 
         # 尝试 Bing
         try:
             text = await self._search_bing(query)
             if text and len(text) > 50:
+                duration_ms = int((time.time() - start_time) * 1000)
                 logger.info(f"Bing 搜索成功: {game_name}, {len(text)} 字符")
-                return {"status": "success", "summary": _build_summary(text)}
+                return {
+                    "status": "success", "summary": _build_summary(text),
+                    "provider": "Bing", "duration_ms": duration_ms,
+                    "result_titles": self._extract_titles(text),
+                }
         except Exception as e:
             logger.warning(f"Bing 搜索失败: {e}")
 
@@ -211,13 +224,32 @@ class SearchService:
         try:
             text = await self._search_baidu(query)
             if text and len(text) > 50:
+                duration_ms = int((time.time() - start_time) * 1000)
                 logger.info(f"百度搜索成功: {game_name}, {len(text)} 字符")
-                return {"status": "success", "summary": _build_summary(text)}
+                return {
+                    "status": "success", "summary": _build_summary(text),
+                    "provider": "百度", "duration_ms": duration_ms,
+                    "result_titles": self._extract_titles(text),
+                }
         except Exception as e:
             logger.warning(f"百度搜索失败: {e}")
 
+        duration_ms = int((time.time() - start_time) * 1000)
         logger.warning(f"所有搜索源均失败: {game_name}")
-        return {"status": "failed", "summary": ""}
+        return {
+            "status": "failed", "summary": "",
+            "provider": "失败", "duration_ms": duration_ms, "result_titles": [],
+        }
+
+    def _extract_titles(self, text: str) -> list[str]:
+        """从搜索摘要中提取简要标题（按行拆分，取前3条）"""
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        titles = []
+        for line in lines[:3]:
+            # 截取前40个字符作为标题
+            title = line[:40] + ("..." if len(line) > 40 else "")
+            titles.append(title)
+        return titles
 
     async def test_search(self, game_name: str) -> dict:
         """
