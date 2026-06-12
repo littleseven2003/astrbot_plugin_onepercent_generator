@@ -176,18 +176,18 @@ class SearchService:
                     texts.append(text)
             if texts:
                 raw = "\n".join(texts)
-                return {"snippets": _extract_snippets(raw), "raw_text": raw}
+                return {"raw_text": raw}
 
         meta_desc = _extract_meta_description(html)
         if meta_desc:
-            return {"snippets": _extract_snippets(meta_desc), "raw_text": meta_desc}
+            return {"raw_text": meta_desc}
 
         full_text = _extract_text_from_html(html)
         summary = _build_summary(full_text)
-        return {"snippets": _extract_snippets(summary), "raw_text": summary}
+        return {"raw_text": summary}
 
     async def _search_baidu(self, query: str) -> dict:
-        """使用百度搜索，返回 {snippets, raw_text}"""
+        """使用百度搜索，返回 {raw_text}"""
         client = await self._get_client()
         url = "https://www.baidu.com/s"
         params = {"wd": query}
@@ -210,11 +210,11 @@ class SearchService:
                     texts.append(text)
             if texts:
                 raw = "\n".join(texts)
-                return {"snippets": _extract_snippets(raw), "raw_text": raw}
+                return {"raw_text": raw}
 
         full_text = _extract_text_from_html(html)
         summary = _build_summary(full_text)
-        return {"snippets": _extract_snippets(summary), "raw_text": summary}
+        return {"raw_text": summary}
 
     async def search_game_info(self, game_name: str) -> dict:
         """
