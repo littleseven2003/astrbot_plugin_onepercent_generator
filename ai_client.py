@@ -79,18 +79,19 @@ class AIClient:
             max_tokens=MAX_TOKENS,
         )
 
-    async def summarize_search(self, game_name: str, raw_text: str) -> dict:
+    async def summarize_search(self, game_name: str, raw_text: str, max_chars: int = 150) -> dict:
         """
         调用 AI 对搜索结果进行分析整理，生成简短的搜索汇总
 
         Args:
             game_name: 游戏名称
             raw_text: 搜索引擎返回的原始文本
+            max_chars: 汇总最大字数
 
         Returns:
             同 generate() 返回结构，content 为整理后的搜索汇总
         """
-        system = "你是一个游戏资讯编辑。请根据提供的搜索资料，用中文写一段简短的游戏信息汇总（100-150字），包括游戏类型、开发商、平台、特色等关键信息。直接输出汇总内容，不要加标题或前缀。"
+        system = f"你是一个游戏资讯编辑。请根据提供的搜索资料，用中文写一段简短的游戏信息汇总（{max_chars}字以内），包括游戏类型、开发商、平台、特色等关键信息。直接输出汇总内容，不要加标题或前缀。"
         user = f"以下是关于游戏「{game_name}」的搜索结果，请整理为一段简短的信息汇总：\n\n{raw_text}"
 
         return await self._call_ai(

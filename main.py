@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.3.3",
+    "0.3.4",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -42,7 +42,10 @@ class OnePercentGenerator(Star):
         self.search_service = SearchService(
             enabled=search_cfg.get("enabled", True),
             timeout_ms=search_cfg.get("timeout_ms", 8000),
+            result_count=search_cfg.get("result_count", 3),
         )
+        self.search_summarize_enabled = search_cfg.get("summarize_enabled", True)
+        self.search_summarize_max_chars = search_cfg.get("summarize_max_chars", 150)
 
         # 频率限制配置
         rate_cfg = self.config.get("rate_limit", {})
@@ -164,14 +167,19 @@ class OnePercentGenerator(Star):
 
         # AI 汇总搜索结果
         search_digest = ""
-        if raw_summary:
+        if raw_summary and self.search_summarize_enabled:
             try:
-                digest_result = await self.ai_client.summarize_search(game_name, raw_summary)
+                digest_result = await self.ai_client.summarize_search(
+                    game_name, raw_summary, self.search_summarize_max_chars
+                )
                 search_digest = digest_result["content"]
                 logger.info(f"[小作文生成器] 搜索汇总完成: {len(search_digest)} 字符")
             except AIClientError as e:
                 logger.warning(f"[小作文生成器] 搜索汇总失败，使用原始摘要: {e}")
-                search_digest = raw_summary[:200]
+                search_digest = raw_summary[:self.search_summarize_max_chars]
+        elif raw_summary:
+            # 未启用搜索汇总，直接使用原始搜索结果
+            search_digest = raw_summary[:self.search_summarize_max_chars]
 
         # 组装 Prompt（使用搜索汇总作为参考）
         prompt = build_main_prompt(game_name, search_digest or raw_summary)

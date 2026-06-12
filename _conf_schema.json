@@ -64,6 +64,24 @@
         "type": "bool",
         "default": true
       },
+      "result_count": {
+        "description": "采用搜索结果条数",
+        "type": "int",
+        "default": 3,
+        "hint": "搜索后采用多少条搜索结果的信息（1-10）"
+      },
+      "summarize_enabled": {
+        "description": "是否启用搜索汇总",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后通过 AI 对搜索结果进行分析整理，关闭则直接使用原始搜索结果"
+      },
+      "summarize_max_chars": {
+        "description": "搜索汇文字数限制",
+        "type": "int",
+        "default": 150,
+        "hint": "AI 生成的搜索汇总文章的最大字数（50-500）"
+      },
       "timeout_ms": {
         "description": "搜索超时时间（毫秒）",
         "type": "int",

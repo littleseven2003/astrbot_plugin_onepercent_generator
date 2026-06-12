@@ -5,7 +5,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Release](https://img.shields.io/badge/Release-v0.3.3-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.3.4-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
@@ -137,6 +137,9 @@ pip install httpx
 | 每日最大请求次数 | 整数 | 每 QQ 号每日限制 | `20` |
 | 是否启用联网搜索 | 布尔 | 是否搜索游戏资料 | `true` |
 | 搜索超时时间 | 整数 | 搜索超时（毫秒） | `8000` |
+| 采用搜索结果条数 | 整数 | 搜索后采用多少条结果信息（1-10） | `3` |
+| 是否启用搜索汇总 | 布尔 | 开启后通过AI整理搜索结果，关闭则直接使用原始结果 | `true` |
+| 搜索汇文字数限制 | 整数 | AI生成的搜索汇总最大字数（50-500） | `150` |
 | 白名单群聊列表 | 列表 | 留空=全部允许，填写群号后仅这些群可用 | 空 |
 | 白名单私聊列表 | 列表 | 留空=全部允许，填写QQ号后仅这些私聊可用 | 空 |
 | 生成后发送统计信息 | 布尔 | 开启后每次生成后额外发送生成信息（模型、耗时、Token、搜索汇总等） | `true` |

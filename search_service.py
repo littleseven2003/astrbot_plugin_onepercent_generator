@@ -94,9 +94,10 @@ def _build_summary(text: str, max_length: int = 1500) -> str:
 class SearchService:
     """联网搜索服务，支持多源并发搜索"""
 
-    def __init__(self, enabled: bool = True, timeout_ms: int = 8000):
+    def __init__(self, enabled: bool = True, timeout_ms: int = 8000, result_count: int = 3):
         self.enabled = enabled
         self.timeout = timeout_ms / 1000
+        self.result_count = max(1, min(result_count, 10))
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -114,8 +115,8 @@ class SearchService:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-    async def _search_bing(self, query: str) -> dict:
-        """使用 Bing 搜索，返回 {snippets, raw_text}"""
+    async def _search_bing(self, query: str, result_count: int = 3) -> dict:
+        """使用 Bing 搜索，返回 {raw_text}"""
         client = await self._get_client()
         url = "https://www.bing.com/search"
         params = {"q": query, "mkt": "zh-CN"}
@@ -130,7 +131,7 @@ class SearchService:
         )
         if results:
             texts = []
-            for r in results[:5]:
+            for r in results[:result_count]:
                 text = re.sub(r'<[^>]+>', '', r).strip()
                 if text:
                     texts.append(text)
@@ -146,7 +147,7 @@ class SearchService:
         summary = _build_summary(full_text)
         return {"raw_text": summary}
 
-    async def _search_baidu(self, query: str) -> dict:
+    async def _search_baidu(self, query: str, result_count: int = 3) -> dict:
         """使用百度搜索，返回 {raw_text}"""
         client = await self._get_client()
         url = "https://www.baidu.com/s"
@@ -164,7 +165,7 @@ class SearchService:
         )
         if results:
             texts = []
-            for r in results[:5]:
+            for r in results[:result_count]:
                 text = re.sub(r'<[^>]+>', '', r).strip()
                 if text:
                     texts.append(text)
@@ -183,11 +184,9 @@ class SearchService:
         Returns:
             {
                 "status": "success" | "partial" | "failed" | "disabled",
-                "summary": str,          # 合并后的搜索摘要（用于 AI 生成）
-                "provider": str,         # 成功的搜索源列表，如 "Bing + 百度"
-                "duration_ms": int,      # 总搜索耗时
-                "result_titles": list,   # 各源摘要片段
-                "search_digest": str,    # 搜索信息汇总（用于展示给用户）
+                "summary": str,
+                "provider": str,
+                "duration_ms": int,
             }
         """
         if not self.enabled:
@@ -200,8 +199,8 @@ class SearchService:
         start_time = time.time()
 
         # 并发搜索多个源
-        bing_task = asyncio.create_task(self._safe_search("Bing", self._search_bing, query))
-        baidu_task = asyncio.create_task(self._safe_search("百度", self._search_baidu, query))
+        bing_task = asyncio.create_task(self._safe_search("Bing", self._search_bing, query, self.result_count))
+        baidu_task = asyncio.create_task(self._safe_search("百度", self._search_baidu, query, self.result_count))
 
         results = await asyncio.gather(bing_task, baidu_task)
         duration_ms = int((time.time() - start_time) * 1000)
@@ -237,10 +236,10 @@ class SearchService:
             "provider": "失败", "duration_ms": duration_ms,
         }
 
-    async def _safe_search(self, name: str, func, query: str) -> tuple[str, dict | None]:
+    async def _safe_search(self, name: str, func, query: str, result_count: int = 3) -> tuple[str, dict | None]:
         """安全执行搜索，捕获异常"""
         try:
-            result = await func(query)
+            result = await func(query, result_count)
             if result.get("raw_text") and len(result["raw_text"]) > 30:
                 return (name, result)
             logger.warning(f"[小作文生成器] {name} 搜索结果过短，跳过")
