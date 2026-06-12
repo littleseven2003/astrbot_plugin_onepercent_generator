@@ -115,3 +115,58 @@ class RateLimiter:
         await kv_storage.put_kv_data(key, json.dumps(record))
 
         return {"allowed": True, "message": ""}
+
+    async def get_usage_status(self, qq_id: str, kv_storage) -> dict:
+        """
+        获取用户当前使用情况
+
+        Returns:
+            {
+                "window_used": int,      # 窗口内已用次数
+                "window_max": int,       # 窗口内最大次数
+                "window_minutes": int,   # 窗口时间（分钟）
+                "daily_used": int,       # 今日已用次数
+                "daily_max": int,        # 每日最大次数
+            }
+        """
+        key = f"{RATE_LIMIT_PREFIX}{qq_id}"
+        now = _get_current_ts()
+        today = _get_today_str()
+
+        record = await kv_storage.get_kv_data(key, None)
+        if record is None:
+            return {
+                "window_used": 0,
+                "window_max": self.max_requests,
+                "window_minutes": self.window_minutes,
+                "daily_used": 0,
+                "daily_max": self.daily_max,
+            }
+
+        if isinstance(record, str):
+            import json
+            record = json.loads(record)
+
+        # 跨天重置
+        if record.get("daily_date") != today:
+            return {
+                "window_used": 0,
+                "window_max": self.max_requests,
+                "window_minutes": self.window_minutes,
+                "daily_used": 0,
+                "daily_max": self.daily_max,
+            }
+
+        # 窗口过期重置
+        window_start = record.get("window_start", now)
+        window_count = record.get("window_count", 0)
+        if now - window_start >= self.window_seconds:
+            window_count = 0
+
+        return {
+            "window_used": window_count,
+            "window_max": self.max_requests,
+            "window_minutes": self.window_minutes,
+            "daily_used": record.get("daily_count", 0),
+            "daily_max": self.daily_max,
+        }
