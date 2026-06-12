@@ -91,14 +91,44 @@ def _build_summary(text: str, max_length: int = 1500) -> str:
     return truncated + "..."
 
 
-def _extract_snippets(text: str, max_items: int = 3) -> list[str]:
-    """从搜索文本中提取简要摘要片段"""
-    lines = [line.strip() for line in text.split("\n") if line.strip() and len(line.strip()) > 10]
-    snippets = []
-    for line in lines[:max_items]:
-        snippet = line[:80] + ("..." if len(line) > 80 else "")
-        snippets.append(snippet)
-    return snippets
+def _build_search_digest(game_name: str, texts: list[str], max_length: int = 200) -> str:
+    """
+    将多个搜索源的文本分析整理为一段简短的搜索汇总
+    提取关键句子，去重合并，形成一段连贯的摘要
+    """
+    # 收集所有句子
+    all_sentences = []
+    for text in texts:
+        # 按中文句号、感叹号、问号、分号拆分
+        parts = re.split(r'[。！？；\n]', text)
+        for part in parts:
+            part = part.strip()
+            # 过滤太短或无意义的片段
+            if len(part) >= 8:
+                all_sentences.append(part)
+
+    # 去重（基于前15字符）
+    seen = set()
+    unique_sentences = []
+    for s in all_sentences:
+        key = s[:15]
+        if key not in seen:
+            seen.add(key)
+            unique_sentences.append(s)
+
+    # 截取到目标长度
+    result_parts = []
+    total_len = 0
+    for s in unique_sentences:
+        if total_len + len(s) + 1 > max_length:
+            break
+        result_parts.append(s)
+        total_len += len(s) + 1
+
+    if not result_parts:
+        return ""
+
+    return "；".join(result_parts) + "。"
 
 
 class SearchService:
@@ -204,7 +234,7 @@ class SearchService:
             return {
                 "status": "disabled", "summary": "",
                 "provider": "未启用", "duration_ms": 0,
-                "result_titles": [], "search_digest": "",
+                "search_digest": "",
             }
 
         query = f"{game_name} 游戏介绍 平台 评价"
@@ -220,26 +250,21 @@ class SearchService:
         # 收集成功的结果
         successful = [(name, res) for name, res in results if res is not None]
         all_texts = []
-        all_snippets = []
+        raw_texts_for_digest = []
         providers = []
 
         for name, res in successful:
             providers.append(name)
             if res.get("raw_text"):
                 all_texts.append(f"[{name}] {res['raw_text']}")
-            all_snippets.extend(res.get("snippets", []))
+                raw_texts_for_digest.append(res["raw_text"])
 
         if successful:
             merged_summary = _build_summary("\n\n".join(all_texts))
             provider_str = " + ".join(providers)
 
-            # 构建搜索信息汇总
-            digest_lines = [f"🔍 搜索信息汇总（{game_name}）"]
-            digest_lines.append(f"搜索源：{provider_str}（耗时 {duration_ms / 1000:.1f}秒）")
-            for i, snippet in enumerate(all_snippets[:5], 1):
-                digest_lines.append(f"{i}. {snippet}")
-            if not all_snippets:
-                digest_lines.append("未提取到有效摘要")
+            # 构建搜索信息汇总（分析整理后的简短摘要）
+            search_digest = _build_search_digest(game_name, raw_texts_for_digest)
 
             logger.info(
                 f"[小作文生成器] 搜索成功: {game_name}, 来源: {provider_str}, "
@@ -250,16 +275,14 @@ class SearchService:
                 "summary": merged_summary,
                 "provider": provider_str,
                 "duration_ms": duration_ms,
-                "result_titles": all_snippets[:3],
-                "search_digest": "\n".join(digest_lines),
+                "search_digest": search_digest,
             }
 
         logger.warning(f"[小作文生成器] 所有搜索源均失败: {game_name}")
         return {
             "status": "failed", "summary": "",
             "provider": "失败", "duration_ms": duration_ms,
-            "result_titles": [],
-            "search_digest": f"🔍 搜索信息汇总（{game_name}）\n搜索失败，未能获取到游戏资料",
+            "search_digest": "",
         }
 
     async def _safe_search(self, name: str, func, query: str) -> tuple[str, dict | None]:

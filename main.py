@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.3.0",
+    "0.3.1",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -66,9 +66,6 @@ class OnePercentGenerator(Star):
 
         # 是否发送生成统计信息
         self.show_generation_stats = self.config.get("show_generation_stats", True)
-
-        # 是否发送搜索信息摘要
-        self.show_search_digest = self.config.get("show_search_digest", True)
 
         logger.info("[小作文生成器] 插件已加载")
 
@@ -182,12 +179,6 @@ class OnePercentGenerator(Star):
         final_message = build_final_message(game_name, ai_content)
         yield event.plain_result(final_message)
 
-        # 搜索信息摘要
-        if self.show_search_digest:
-            search_digest = search_result.get("search_digest", "")
-            if search_digest:
-                yield event.plain_result(search_digest)
-
         # 组装生成信息
         if self.show_generation_stats:
             sender_name = event.get_sender_name() or sender_id
@@ -196,11 +187,7 @@ class OnePercentGenerator(Star):
             tokens = ai_result["token_usage"]
             search_provider = search_result.get("provider", "未使用")
             search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
-            result_titles = search_result.get("result_titles", [])
-            search_results_str = (
-                " ".join(f"{i+1}. {t}" for i, t in enumerate(result_titles))
-                if result_titles else "无"
-            )
+            search_digest = search_result.get("search_digest", "")
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)
@@ -216,9 +203,8 @@ class OnePercentGenerator(Star):
                 f"生成模型：{ai_result['model']}",
                 f"生成时间：{duration_s}",
                 f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
-                f"搜索服务：{search_provider}",
-                f"搜索时间：{search_duration}",
-                f"搜索结果：{search_results_str}",
+                f"搜索服务：{search_provider}（{search_duration}）",
+                f"搜索汇总：{search_digest if search_digest else '无'}",
                 f"用户限制：{usage_str}",
             ]
             yield event.plain_result("\n".join(info_lines))

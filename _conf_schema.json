@@ -86,13 +86,7 @@
   "show_generation_stats": {
     "description": "生成后发送统计信息",
     "type": "bool",
-    "hint": "开启后每次生成小作文后会额外发送一条生成信息（模型、耗时、Token、搜索等）",
-    "default": true
-  },
-  "show_search_digest": {
-    "description": "生成后发送搜索信息摘要",
-    "type": "bool",
-    "hint": "开启后每次生成小作文后会额外发送一条搜索信息汇总（搜索源、摘要片段等）",
+    "hint": "开启后每次生成小作文后会额外发送一条生成信息（模型、耗时、Token、搜索汇总等）",
     "default": true
   }
 }
