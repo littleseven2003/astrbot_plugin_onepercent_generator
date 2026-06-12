@@ -5,7 +5,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Release](https://img.shields.io/badge/Release-v0.2.0-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.2.1-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
@@ -139,6 +139,7 @@ pip install httpx
 | 搜索超时时间 | 整数 | 搜索超时（毫秒） | `8000` |
 | 白名单群聊列表 | 列表 | 留空=全部允许，填写群号后仅这些群可用 | 空 |
 | 白名单私聊列表 | 列表 | 留空=全部允许，填写QQ号后仅这些私聊可用 | 空 |
+| 生成后发送统计信息 | 布尔 | 开启后每次生成后额外发送生成信息（模型、耗时、Token等） | `true` |
 
 ### 频率限制说明
 

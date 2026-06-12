@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.2.0",
+    "0.2.1",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -63,6 +63,9 @@ class OnePercentGenerator(Star):
         # 白名单
         self.whitelist_groups = self.config.get("whitelist_groups", [])
         self.whitelist_privates = self.config.get("whitelist_privates", [])
+
+        # 是否发送生成统计信息
+        self.show_generation_stats = self.config.get("show_generation_stats", True)
 
         logger.info("[小作文生成器] 插件已加载")
 
@@ -177,38 +180,39 @@ class OnePercentGenerator(Star):
         yield event.plain_result(final_message)
 
         # 组装生成信息
-        sender_name = event.get_sender_name() or sender_id
-        game_mode = f"随机-{game_name}" if is_random else game_name
-        duration_s = f"{ai_result['duration_ms'] / 1000:.1f}秒"
-        tokens = ai_result["token_usage"]
-        search_provider = search_result.get("provider", "未使用")
-        search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
-        result_titles = search_result.get("result_titles", [])
-        search_results_str = (
-            " ".join(f"{i+1}. {t}" for i, t in enumerate(result_titles))
-            if result_titles else "无"
-        )
+        if self.show_generation_stats:
+            sender_name = event.get_sender_name() or sender_id
+            game_mode = f"随机-{game_name}" if is_random else game_name
+            duration_s = f"{ai_result['duration_ms'] / 1000:.1f}秒"
+            tokens = ai_result["token_usage"]
+            search_provider = search_result.get("provider", "未使用")
+            search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
+            result_titles = search_result.get("result_titles", [])
+            search_results_str = (
+                " ".join(f"{i+1}. {t}" for i, t in enumerate(result_titles))
+                if result_titles else "无"
+            )
 
-        # 用户使用情况
-        usage = await self.rate_limiter.get_usage_status(sender_id, self)
-        usage_str = (
-            f"窗口：{usage['window_used']}/{usage['window_max']}（{usage['window_minutes']}分钟），"
-            f"今日：{usage['daily_used']}/{usage['daily_max']}"
-        )
+            # 用户使用情况
+            usage = await self.rate_limiter.get_usage_status(sender_id, self)
+            usage_str = (
+                f"窗口：{usage['window_used']}/{usage['window_max']}（{usage['window_minutes']}分钟），"
+                f"今日：{usage['daily_used']}/{usage['daily_max']}"
+            )
 
-        info_lines = [
-            "📊 本次生成信息",
-            f"调用者：{sender_name}（{sender_id}）",
-            f"指定游戏：{game_mode}",
-            f"生成模型：{ai_result['model']}",
-            f"生成时间：{duration_s}",
-            f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
-            f"搜索服务：{search_provider}",
-            f"搜索时间：{search_duration}",
-            f"搜索结果：{search_results_str}",
-            f"用户限制：{usage_str}",
-        ]
-        yield event.plain_result("\n".join(info_lines))
+            info_lines = [
+                "📊 本次生成信息",
+                f"调用者：{sender_name}（{sender_id}）",
+                f"指定游戏：{game_mode}",
+                f"生成模型：{ai_result['model']}",
+                f"生成时间：{duration_s}",
+                f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
+                f"搜索服务：{search_provider}",
+                f"搜索时间：{search_duration}",
+                f"搜索结果：{search_results_str}",
+                f"用户限制：{usage_str}",
+            ]
+            yield event.plain_result("\n".join(info_lines))
         event.stop_event()
 
     # ========================================================================
