@@ -59,28 +59,51 @@ class AIClient:
 
     async def generate(self, prompt: str) -> dict:
         """
-        调用 AI 生成内容
+        调用 AI 生成内容（通用方法）
 
         Args:
-            prompt: 用户 prompt（由 build_main_prompt 生成）
+            prompt: 用户 prompt
 
         Returns:
             {
-                "content": str,       # AI 生成的文本
-                "model": str,         # 模型名称
-                "duration_ms": int,   # 生成耗时（毫秒）
-                "token_usage": {      # token 消耗
-                    "prompt_tokens": int,
-                    "completion_tokens": int,
-                    "total_tokens": int,
-                }
+                "content": str,
+                "model": str,
+                "duration_ms": int,
+                "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
             }
+        """
+        return await self._call_ai(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
 
-        Raises:
-            AIClientNotConfigured: 未配置模型信息
-            AIClientTimeout: 请求超时
-            AIClientAPIError: API 返回错误
-            AIClientError: 其他调用错误
+    async def summarize_search(self, game_name: str, raw_text: str) -> dict:
+        """
+        调用 AI 对搜索结果进行分析整理，生成简短的搜索汇总
+
+        Args:
+            game_name: 游戏名称
+            raw_text: 搜索引擎返回的原始文本
+
+        Returns:
+            同 generate() 返回结构，content 为整理后的搜索汇总
+        """
+        system = "你是一个游戏资讯编辑。请根据提供的搜索资料，用中文写一段简短的游戏信息汇总（100-150字），包括游戏类型、开发商、平台、特色等关键信息。直接输出汇总内容，不要加标题或前缀。"
+        user = f"以下是关于游戏「{game_name}」的搜索结果，请整理为一段简短的信息汇总：\n\n{raw_text}"
+
+        return await self._call_ai(
+            system_prompt=system,
+            user_prompt=user,
+            temperature=0.3,
+            max_tokens=300,
+        )
+
+    async def _call_ai(self, system_prompt: str, user_prompt: str,
+                       temperature: float = 0.8, max_tokens: int = 2048) -> dict:
+        """
+        底层 AI 调用
         """
         if not self.is_configured:
             msg = "未配置 AI 模型信息（Base URL 或 API Key 为空）"
@@ -99,11 +122,11 @@ class AIClient:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         }
 
         logger.info(f"[小作文生成器] 调用 AI API: {self.model} @ {self.base_url}")

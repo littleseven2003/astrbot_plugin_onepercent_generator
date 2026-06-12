@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.3.1",
+    "0.3.3",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -159,13 +159,24 @@ class OnePercentGenerator(Star):
 
         # 联网搜索
         search_result = await self.search_service.search_game_info(game_name)
-        search_summary = search_result.get("summary", "")
+        raw_summary = search_result.get("summary", "")
         logger.info(f"[小作文生成器] 搜索状态: {search_result['status']}, 游戏: {game_name}")
 
-        # 组装 Prompt
-        prompt = build_main_prompt(game_name, search_summary)
+        # AI 汇总搜索结果
+        search_digest = ""
+        if raw_summary:
+            try:
+                digest_result = await self.ai_client.summarize_search(game_name, raw_summary)
+                search_digest = digest_result["content"]
+                logger.info(f"[小作文生成器] 搜索汇总完成: {len(search_digest)} 字符")
+            except AIClientError as e:
+                logger.warning(f"[小作文生成器] 搜索汇总失败，使用原始摘要: {e}")
+                search_digest = raw_summary[:200]
 
-        # 调用 AI
+        # 组装 Prompt（使用搜索汇总作为参考）
+        prompt = build_main_prompt(game_name, search_digest or raw_summary)
+
+        # 调用 AI 生成小作文
         try:
             ai_result = await self.ai_client.generate(prompt)
         except AIClientError as e:
@@ -187,7 +198,6 @@ class OnePercentGenerator(Star):
             tokens = ai_result["token_usage"]
             search_provider = search_result.get("provider", "未使用")
             search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
-            search_digest = search_result.get("search_digest", "")
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)

@@ -1,5 +1,15 @@
 # 更新日志
 
+## v0.3.3 - 2026-06-12
+
+### 修复
+
+- 修复搜索汇总逻辑：改为 AI 调用整理搜索结果（不再是正则提取）
+- 正确流程：搜索 → AI汇总搜索结果 → AI生成小作文 → 回复文章 → 回复统计
+- `ai_client` 新增 `summarize_search()` 方法，专用 Prompt 汇总搜索资料
+- `ai_client` 底层重构为 `_call_ai()` 通用方法，支持不同 system prompt 和参数
+- 删除 `search_service` 中的 `_build_search_digest` 正则提取逻辑
+
 ## v0.3.1 - 2026-06-12
 
 ### 变更
