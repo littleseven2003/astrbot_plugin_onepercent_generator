@@ -1,5 +1,20 @@
 # 更新日志
 
+## v0.4.0 - 2026-08-17
+
+### 新增
+
+- 插件设置菜单新增「API 格式」下拉选项
+- 保留现有 Chat Completions（`/chat/completions`）调用方式并设为默认值
+- 新增 OpenAI Responses API（`/responses`）请求与响应解析
+- Responses API 的 `input_tokens` / `output_tokens` 自动映射到统一统计字段
+
+### 工程化
+
+- 新增 Python 3.10 / 3.12 GitHub Actions 持续集成
+- 新增核心模块单元测试
+- 重写设计文档，使其与当前白名单、搜索和 AI 调用实现保持一致
+
 ## v0.3.4 - 2026-06-12
 
 ### 新增

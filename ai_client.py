@@ -17,6 +17,13 @@ TEMPERATURE = 0.8
 MAX_TOKENS = 2048
 TIMEOUT_SECONDS = 120
 
+API_FORMAT_CHAT_COMPLETIONS = "chat_completions"
+API_FORMAT_RESPONSES = "responses"
+SUPPORTED_API_FORMATS = {
+    API_FORMAT_CHAT_COMPLETIONS,
+    API_FORMAT_RESPONSES,
+}
+
 
 class AIClientError(Exception):
     """AI 客户端错误基类"""
@@ -39,12 +46,28 @@ class AIClientAPIError(AIClientError):
 
 
 class AIClient:
-    """AI API 客户端，兼容 OpenAI Chat Completions 格式"""
+    """AI API 客户端，兼容 OpenAI Chat Completions 与 Responses 格式"""
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        api_format: str = API_FORMAT_CHAT_COMPLETIONS,
+    ):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.model = model or "deepseek-chat"
+        normalized_format = str(
+            api_format or API_FORMAT_CHAT_COMPLETIONS
+        ).strip().lower()
+        if normalized_format not in SUPPORTED_API_FORMATS:
+            logger.warning(
+                "[小作文生成器] 未知 API 格式 %r，回退到 Chat Completions",
+                api_format,
+            )
+            normalized_format = API_FORMAT_CHAT_COMPLETIONS
+        self.api_format = normalized_format
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -57,6 +80,83 @@ class AIClient:
             self._client = httpx.AsyncClient(timeout=TIMEOUT_SECONDS)
         return self._client
 
+    def _build_request(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[str, dict]:
+        """根据配置构造 API 地址与请求体。"""
+        if self.api_format == API_FORMAT_RESPONSES:
+            return f"{self.base_url}/responses", {
+                "model": self.model,
+                "instructions": system_prompt,
+                "input": user_prompt,
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+                "store": False,
+            }
+
+        return f"{self.base_url}/chat/completions", {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+    def _extract_content(self, data: dict) -> str:
+        """从不同 API 格式的响应中提取最终文本。"""
+        if self.api_format == API_FORMAT_CHAT_COMPLETIONS:
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Chat Completions 响应正文为空")
+            return content
+
+        # 部分兼容服务会直接返回 SDK 风格的 output_text。
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        text_parts = []
+        for item in data.get("output", []):
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content_item in item.get("content", []):
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") not in {"output_text", "text"}:
+                    continue
+                text = content_item.get("text")
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+
+        if not text_parts:
+            raise ValueError("Responses API 响应中没有可用的文本输出")
+        return "\n".join(text_parts)
+
+    def _extract_token_usage(self, data: dict) -> dict:
+        """将不同 API 格式的 Token 统计归一化。"""
+        usage = data.get("usage") or {}
+        if self.api_format == API_FORMAT_RESPONSES:
+            prompt_tokens = usage.get("input_tokens", 0)
+            completion_tokens = usage.get("output_tokens", 0)
+        else:
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": usage.get(
+                "total_tokens",
+                prompt_tokens + completion_tokens,
+            ),
+        }
+
     async def generate(self, prompt: str) -> dict:
         """
         调用 AI 生成内容（通用方法）
@@ -68,6 +168,7 @@ class AIClient:
             {
                 "content": str,
                 "model": str,
+                "api_format": str,
                 "duration_ms": int,
                 "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
             }
@@ -115,22 +216,21 @@ class AIClient:
             )
 
         client = await self._get_client()
-        url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        url, payload = self._build_request(
+            system_prompt,
+            user_prompt,
+            temperature,
+            max_tokens,
+        )
 
-        logger.info(f"[小作文生成器] 调用 AI API: {self.model} @ {self.base_url}")
+        logger.info(
+            f"[小作文生成器] 调用 AI API: {self.model} "
+            f"({self.api_format}) @ {self.base_url}"
+        )
         start_time = time.time()
 
         try:
@@ -138,16 +238,10 @@ class AIClient:
             resp.raise_for_status()
             data = resp.json()
 
-            content = data["choices"][0]["message"]["content"]
+            content = self._extract_content(data)
             duration_ms = int((time.time() - start_time) * 1000)
 
-            # 提取 token 用量
-            usage = data.get("usage", {})
-            token_usage = {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
+            token_usage = self._extract_token_usage(data)
 
             logger.info(
                 f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符，"
@@ -155,7 +249,8 @@ class AIClient:
             )
             return {
                 "content": content,
-                "model": self.model,
+                "model": data.get("model", self.model),
+                "api_format": self.api_format,
                 "duration_ms": duration_ms,
                 "token_usage": token_usage,
             }
@@ -170,7 +265,10 @@ class AIClient:
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            msg = f"AI API 返回 HTTP {status}: {self.model} @ {self.base_url}"
+            msg = (
+                f"AI API 返回 HTTP {status}: {self.model} "
+                f"({self.api_format}) @ {self.base_url}"
+            )
             logger.error(f"[小作文生成器] {msg}")
             detail = ""
             if status == 401:
@@ -211,47 +309,25 @@ class AIClient:
             }
 
         try:
-            client = await self._get_client()
-            url = f"{self.base_url}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "user", "content": "请回复'连接正常'四个字"},
-                ],
-                "temperature": 0,
-                "max_tokens": 20,
-            }
-
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            reply = data["choices"][0]["message"]["content"]
+            await self._call_ai(
+                system_prompt="你是一个连接测试助手。",
+                user_prompt="请回复'连接正常'四个字",
+                temperature=0,
+                max_tokens=20,
+            )
 
             return {
                 "success": True,
-                "message": f"模型服务正常，当前模型：{self.model}",
+                "message": (
+                    f"模型服务正常，当前模型：{self.model}，"
+                    f"API 格式：{self.api_format}"
+                ),
                 "model": self.model,
             }
-        except httpx.TimeoutException:
+        except AIClientError as e:
             return {
                 "success": False,
-                "message": "连接超时，请检查 API 地址是否正确",
-                "model": self.model,
-            }
-        except httpx.HTTPStatusError as e:
-            return {
-                "success": False,
-                "message": f"API 返回错误: HTTP {e.response.status_code}",
-                "model": self.model,
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"连接失败: {str(e)}",
+                "message": e.user_message.removeprefix("❌ "),
                 "model": self.model,
             }
 

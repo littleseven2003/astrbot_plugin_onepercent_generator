@@ -20,6 +20,14 @@
         "hint": "输入你的 API Key",
         "obvious_hint": true
       },
+      "api_format": {
+        "description": "API 格式",
+        "type": "string",
+        "options": ["chat_completions", "responses"],
+        "labels": ["Chat Completions（/chat/completions）", "Responses（/responses）"],
+        "default": "chat_completions",
+        "hint": "选择模型服务使用的 OpenAI 兼容接口格式。已有配置默认继续使用 Chat Completions"
+      },
       "model": {
         "description": "模型名称",
         "type": "string",

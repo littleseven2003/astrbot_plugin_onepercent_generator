@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.3.4",
+    "0.4.0",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -35,6 +35,7 @@ class OnePercentGenerator(Star):
             base_url=ai_cfg.get("base_url", ""),
             api_key=ai_cfg.get("api_key", ""),
             model=ai_cfg.get("model", "deepseek-chat"),
+            api_format=ai_cfg.get("api_format", "chat_completions"),
         )
 
         # 搜索配置
@@ -219,6 +220,7 @@ class OnePercentGenerator(Star):
                 f"调用者：{sender_name}（{sender_id}）",
                 f"指定游戏：{game_mode}",
                 f"生成模型：{ai_result['model']}",
+                f"API格式：{ai_result['api_format']}",
                 f"生成时间：{duration_s}",
                 f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
                 f"搜索服务：{search_provider}（{search_duration}）",

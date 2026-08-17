@@ -5,7 +5,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Release](https://img.shields.io/badge/Release-v0.3.4-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.4.0-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
@@ -20,7 +20,7 @@
 * ✅ **格式一致**：完全复现原项目 Prompt 与后处理逻辑，游戏名由程序拼装不经过 AI
 * ⏱️ **频率限制**：基于 QQ 号的滑动窗口 + 每日上限双重限制，防止滥用
 * 📋 **白名单控制**：可配置白名单群聊/私聊列表，精准控制功能使用范围
-* 🔧 **模型兼容**：兼容 OpenAI 格式 API（DeepSeek / OpenAI / 通义千问等）
+* 🔧 **模型兼容**：可在设置菜单选择 Chat Completions 或 Responses API 格式
 
 ---
 
@@ -51,7 +51,10 @@ pip install httpx
 | :--- | :--- | :--- |
 | API Base URL | 兼容 OpenAI 格式的 API 地址 | `https://api.deepseek.com/v1` |
 | API Key | 你的 API 密钥 | `sk-xxxxxxxx` |
+| API 格式 | 服务使用的接口格式 | `chat_completions` 或 `responses` |
 | 模型名称 | 使用的模型 | `deepseek-chat` |
+
+已有配置会继续使用 `chat_completions`。当服务要求 OpenAI Responses API 时，将 API 格式切换为 `responses`；插件会调用 `{Base URL}/responses`，无需把 `/responses` 手动写入 Base URL。
 
 ### 步骤 3：配置管理员（可选）
 
@@ -130,6 +133,7 @@ pip install httpx
 | 管理员QQ号列表 | 列表 | 支持多个管理员 | 空 |
 | AI Base URL | 字符串 | API 地址，兼容 OpenAI 格式 | — |
 | AI API Key | 字符串 | API 密钥 | — |
+| AI API 格式 | 下拉选项 | Chat Completions 或 Responses API | `chat_completions` |
 | AI Model | 字符串 | 模型名称 | `deepseek-chat` |
 | 预设游戏列表 | 列表 | 随机生成时的游戏池 | 原神、星露谷物语、艾尔登法环、塞尔达传说：王国之泪、博德之门3 |
 | 限制时间窗口 | 整数 | 滑动窗口（分钟） | `10` |

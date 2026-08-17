@@ -1,13 +1,18 @@
+import json
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import httpx
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR.parent))
 
 from astrbot_plugin_onepercent_generator.ai_client import (  # noqa: E402
+    API_FORMAT_CHAT_COMPLETIONS,
+    API_FORMAT_RESPONSES,
     AIClient,
     AIClientNotConfigured,
 )
@@ -133,6 +138,131 @@ class AIClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AIClientNotConfigured):
             await client.generate("测试")
+
+    def test_unknown_api_format_falls_back_to_chat_completions(self):
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="test-model",
+            api_format="unknown",
+        )
+
+        self.assertEqual(client.api_format, API_FORMAT_CHAT_COMPLETIONS)
+
+    async def test_chat_completions_request_and_response(self):
+        async def handler(request):
+            payload = json.loads(request.content)
+            self.assertEqual(request.url.path, "/v1/chat/completions")
+            self.assertEqual(payload["messages"][0]["role"], "system")
+            self.assertEqual(payload["max_tokens"], 2048)
+            return httpx.Response(
+                200,
+                json={
+                    "model": "chat-model",
+                    "choices": [
+                        {"message": {"content": "Chat Completions 正文"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "total_tokens": 30,
+                    },
+                },
+            )
+
+        client = AIClient(
+            base_url="https://example.com/v1/",
+            api_key="test-key",
+            model="configured-model",
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        try:
+            result = await client.generate("生成内容")
+        finally:
+            await client.close()
+
+        self.assertEqual(result["content"], "Chat Completions 正文")
+        self.assertEqual(result["model"], "chat-model")
+        self.assertEqual(result["api_format"], API_FORMAT_CHAT_COMPLETIONS)
+        self.assertEqual(result["token_usage"]["total_tokens"], 30)
+
+    async def test_responses_request_and_response(self):
+        async def handler(request):
+            payload = json.loads(request.content)
+            self.assertEqual(request.url.path, "/v1/responses")
+            self.assertEqual(payload["instructions"], "系统提示词")
+            self.assertEqual(payload["input"], "用户提示词")
+            self.assertEqual(payload["max_output_tokens"], 99)
+            self.assertFalse(payload["store"])
+            self.assertNotIn("messages", payload)
+            return httpx.Response(
+                200,
+                json={
+                    "model": "responses-model",
+                    "output": [
+                        {"type": "reasoning", "content": []},
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Responses 正文",
+                                }
+                            ],
+                        },
+                    ],
+                    "usage": {
+                        "input_tokens": 11,
+                        "output_tokens": 22,
+                        "total_tokens": 33,
+                    },
+                },
+            )
+
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="configured-model",
+            api_format=API_FORMAT_RESPONSES,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        try:
+            result = await client._call_ai(
+                system_prompt="系统提示词",
+                user_prompt="用户提示词",
+                temperature=0.3,
+                max_tokens=99,
+            )
+        finally:
+            await client.close()
+
+        self.assertEqual(result["content"], "Responses 正文")
+        self.assertEqual(result["model"], "responses-model")
+        self.assertEqual(result["api_format"], API_FORMAT_RESPONSES)
+        self.assertEqual(
+            result["token_usage"],
+            {
+                "prompt_tokens": 11,
+                "completion_tokens": 22,
+                "total_tokens": 33,
+            },
+        )
+
+    def test_responses_top_level_output_text_compatibility(self):
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="test-model",
+            api_format=API_FORMAT_RESPONSES,
+        )
+
+        self.assertEqual(
+            client._extract_content({"output_text": "兼容服务正文"}),
+            "兼容服务正文",
+        )
 
 
 if __name__ == "__main__":
