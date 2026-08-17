@@ -22,7 +22,7 @@ from .whitelist import is_session_allowed
     "littleseven2003",
     "百分之一小作文生成器",
     "在QQ聊天中通过关键词触发，自动生成符合TapTap《百分之一》活动格式的游戏推荐帖",
-    "0.2.1",
+    "0.3.4",
 )
 class OnePercentGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -42,7 +42,10 @@ class OnePercentGenerator(Star):
         self.search_service = SearchService(
             enabled=search_cfg.get("enabled", True),
             timeout_ms=search_cfg.get("timeout_ms", 8000),
+            result_count=search_cfg.get("result_count", 3),
         )
+        self.search_summarize_enabled = search_cfg.get("summarize_enabled", True)
+        self.search_summarize_max_chars = search_cfg.get("summarize_max_chars", 150)
 
         # 频率限制配置
         rate_cfg = self.config.get("rate_limit", {})
@@ -159,13 +162,29 @@ class OnePercentGenerator(Star):
 
         # 联网搜索
         search_result = await self.search_service.search_game_info(game_name)
-        search_summary = search_result.get("summary", "")
+        raw_summary = search_result.get("summary", "")
         logger.info(f"[小作文生成器] 搜索状态: {search_result['status']}, 游戏: {game_name}")
 
-        # 组装 Prompt
-        prompt = build_main_prompt(game_name, search_summary)
+        # AI 汇总搜索结果
+        search_digest = ""
+        if raw_summary and self.search_summarize_enabled:
+            try:
+                digest_result = await self.ai_client.summarize_search(
+                    game_name, raw_summary, self.search_summarize_max_chars
+                )
+                search_digest = digest_result["content"]
+                logger.info(f"[小作文生成器] 搜索汇总完成: {len(search_digest)} 字符")
+            except AIClientError as e:
+                logger.warning(f"[小作文生成器] 搜索汇总失败，使用原始摘要: {e}")
+                search_digest = raw_summary[:self.search_summarize_max_chars]
+        elif raw_summary:
+            # 未启用搜索汇总，直接使用原始搜索结果
+            search_digest = raw_summary[:self.search_summarize_max_chars]
 
-        # 调用 AI
+        # 组装 Prompt（使用搜索汇总作为参考）
+        prompt = build_main_prompt(game_name, search_digest or raw_summary)
+
+        # 调用 AI 生成小作文
         try:
             ai_result = await self.ai_client.generate(prompt)
         except AIClientError as e:
@@ -187,11 +206,6 @@ class OnePercentGenerator(Star):
             tokens = ai_result["token_usage"]
             search_provider = search_result.get("provider", "未使用")
             search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
-            result_titles = search_result.get("result_titles", [])
-            search_results_str = (
-                " ".join(f"{i+1}. {t}" for i, t in enumerate(result_titles))
-                if result_titles else "无"
-            )
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)
@@ -207,9 +221,8 @@ class OnePercentGenerator(Star):
                 f"生成模型：{ai_result['model']}",
                 f"生成时间：{duration_s}",
                 f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
-                f"搜索服务：{search_provider}",
-                f"搜索时间：{search_duration}",
-                f"搜索结果：{search_results_str}",
+                f"搜索服务：{search_provider}（{search_duration}）",
+                f"搜索汇总：{search_digest if search_digest else '无'}",
                 f"用户限制：{usage_str}",
             ]
             yield event.plain_result("\n".join(info_lines))

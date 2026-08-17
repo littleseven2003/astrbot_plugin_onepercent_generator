@@ -1,8 +1,9 @@
 """
 联网搜索服务模块
-支持 Bing → 百度 多源 fallback，自动提取游戏资料
+支持 Bing + 百度多源并发搜索，自动提取游戏资料并形成搜索汇总
 """
 
+import asyncio
 import logging
 import random
 import re
@@ -21,9 +22,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
 ]
-
-# 单个搜索源超时（秒）
-SINGLE_SOURCE_TIMEOUT = 8
 
 
 class _TextExtractor(HTMLParser):
@@ -62,7 +60,6 @@ def _extract_meta_description(html: str) -> str:
     )
     if match:
         return match.group(1).strip()
-    # 尝试 content 在 name 前面的情况
     match = re.search(
         r'<meta\s+content=["\'](.*?)["\']\s+name=["\']description["\']',
         html,
@@ -87,7 +84,6 @@ def _build_summary(text: str, max_length: int = 1500) -> str:
     """截取摘要文本"""
     if len(text) <= max_length:
         return text
-    # 在合适的位置截断
     truncated = text[:max_length]
     last_period = max(truncated.rfind("。"), truncated.rfind("！"), truncated.rfind("？"))
     if last_period > max_length // 2:
@@ -96,11 +92,12 @@ def _build_summary(text: str, max_length: int = 1500) -> str:
 
 
 class SearchService:
-    """联网搜索服务"""
+    """联网搜索服务，支持多源并发搜索"""
 
-    def __init__(self, enabled: bool = True, timeout_ms: int = 8000):
+    def __init__(self, enabled: bool = True, timeout_ms: int = 8000, result_count: int = 3):
         self.enabled = enabled
-        self.timeout = timeout_ms / 1000  # 转换为秒
+        self.timeout = timeout_ms / 1000
+        self.result_count = max(1, min(result_count, 10))
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -118,8 +115,8 @@ class SearchService:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-    async def _search_bing(self, query: str) -> str:
-        """使用 Bing 搜索"""
+    async def _search_bing(self, query: str, result_count: int = 3) -> dict:
+        """使用 Bing 搜索，返回 {raw_text}"""
         client = await self._get_client()
         url = "https://www.bing.com/search"
         params = {"q": query, "mkt": "zh-CN"}
@@ -127,7 +124,6 @@ class SearchService:
         resp.raise_for_status()
         html = resp.text
 
-        # 提取搜索结果摘要
         results = re.findall(
             r'<li\s+class="b_algo".*?<p>(.*?)</p>',
             html,
@@ -135,24 +131,24 @@ class SearchService:
         )
         if results:
             texts = []
-            for r in results[:5]:
+            for r in results[:result_count]:
                 text = re.sub(r'<[^>]+>', '', r).strip()
                 if text:
                     texts.append(text)
             if texts:
-                return "\n".join(texts)
+                raw = "\n".join(texts)
+                return {"raw_text": raw}
 
-        # fallback: 提取 meta description
         meta_desc = _extract_meta_description(html)
         if meta_desc:
-            return meta_desc
+            return {"raw_text": meta_desc}
 
-        # fallback: 提取全部文本
         full_text = _extract_text_from_html(html)
-        return _build_summary(full_text)
+        summary = _build_summary(full_text)
+        return {"raw_text": summary}
 
-    async def _search_baidu(self, query: str) -> str:
-        """使用百度搜索"""
+    async def _search_baidu(self, query: str, result_count: int = 3) -> dict:
+        """使用百度搜索，返回 {raw_text}"""
         client = await self._get_client()
         url = "https://www.baidu.com/s"
         params = {"wd": query}
@@ -162,7 +158,6 @@ class SearchService:
         resp.raise_for_status()
         html = resp.text
 
-        # 提取搜索结果摘要
         results = re.findall(
             r'<div\s+class="c-abstract".*?>(.*?)</div>',
             html,
@@ -170,101 +165,91 @@ class SearchService:
         )
         if results:
             texts = []
-            for r in results[:5]:
+            for r in results[:result_count]:
                 text = re.sub(r'<[^>]+>', '', r).strip()
                 if text:
                     texts.append(text)
             if texts:
-                return "\n".join(texts)
+                raw = "\n".join(texts)
+                return {"raw_text": raw}
 
-        # fallback: 提取全部文本
         full_text = _extract_text_from_html(html)
-        return _build_summary(full_text)
+        summary = _build_summary(full_text)
+        return {"raw_text": summary}
 
     async def search_game_info(self, game_name: str) -> dict:
         """
-        搜索游戏信息
-
-        Args:
-            game_name: 游戏名称
+        多源并发搜索游戏信息，至少从 2 个搜索源获取结果
 
         Returns:
             {
                 "status": "success" | "partial" | "failed" | "disabled",
-                "summary": "搜索结果摘要",
-                "provider": "Bing" | "百度" | "未启用" | "失败",
+                "summary": str,
+                "provider": str,
                 "duration_ms": int,
-                "result_titles": ["标题1", "标题2", ...],
             }
         """
         if not self.enabled:
             return {
                 "status": "disabled", "summary": "",
-                "provider": "未启用", "duration_ms": 0, "result_titles": [],
+                "provider": "未启用", "duration_ms": 0,
             }
 
         query = f"{game_name} 游戏介绍 平台 评价"
         start_time = time.time()
 
-        # 尝试 Bing
-        try:
-            text = await self._search_bing(query)
-            if text and len(text) > 50:
-                duration_ms = int((time.time() - start_time) * 1000)
-                logger.info(f"Bing 搜索成功: {game_name}, {len(text)} 字符")
-                return {
-                    "status": "success", "summary": _build_summary(text),
-                    "provider": "Bing", "duration_ms": duration_ms,
-                    "result_titles": self._extract_titles(text),
-                }
-        except Exception as e:
-            logger.warning(f"Bing 搜索失败: {e}")
+        # 并发搜索多个源
+        bing_task = asyncio.create_task(self._safe_search("Bing", self._search_bing, query, self.result_count))
+        baidu_task = asyncio.create_task(self._safe_search("百度", self._search_baidu, query, self.result_count))
 
-        # 尝试百度
-        try:
-            text = await self._search_baidu(query)
-            if text and len(text) > 50:
-                duration_ms = int((time.time() - start_time) * 1000)
-                logger.info(f"百度搜索成功: {game_name}, {len(text)} 字符")
-                return {
-                    "status": "success", "summary": _build_summary(text),
-                    "provider": "百度", "duration_ms": duration_ms,
-                    "result_titles": self._extract_titles(text),
-                }
-        except Exception as e:
-            logger.warning(f"百度搜索失败: {e}")
-
+        results = await asyncio.gather(bing_task, baidu_task)
         duration_ms = int((time.time() - start_time) * 1000)
-        logger.warning(f"所有搜索源均失败: {game_name}")
+
+        # 收集成功的结果
+        successful = [(name, res) for name, res in results if res is not None]
+        all_texts = []
+        providers = []
+
+        for name, res in successful:
+            providers.append(name)
+            if res.get("raw_text"):
+                all_texts.append(f"[{name}] {res['raw_text']}")
+
+        if successful:
+            merged_summary = _build_summary("\n\n".join(all_texts))
+            provider_str = " + ".join(providers)
+
+            logger.info(
+                f"[小作文生成器] 搜索成功: {game_name}, 来源: {provider_str}, "
+                f"合并 {len(merged_summary)} 字符, 耗时 {duration_ms}ms"
+            )
+            return {
+                "status": "success",
+                "summary": merged_summary,
+                "provider": provider_str,
+                "duration_ms": duration_ms,
+            }
+
+        logger.warning(f"[小作文生成器] 所有搜索源均失败: {game_name}")
         return {
             "status": "failed", "summary": "",
-            "provider": "失败", "duration_ms": duration_ms, "result_titles": [],
+            "provider": "失败", "duration_ms": duration_ms,
         }
 
-    def _extract_titles(self, text: str) -> list[str]:
-        """从搜索摘要中提取简要标题（按行拆分，取前3条）"""
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        titles = []
-        for line in lines[:3]:
-            # 截取前40个字符作为标题
-            title = line[:40] + ("..." if len(line) > 40 else "")
-            titles.append(title)
-        return titles
+    async def _safe_search(self, name: str, func, query: str, result_count: int = 3) -> tuple[str, dict | None]:
+        """安全执行搜索，捕获异常"""
+        try:
+            result = await func(query, result_count)
+            if result.get("raw_text") and len(result["raw_text"]) > 30:
+                return (name, result)
+            logger.warning(f"[小作文生成器] {name} 搜索结果过短，跳过")
+            return (name, None)
+        except Exception as e:
+            logger.warning(f"[小作文生成器] {name} 搜索失败: {e}")
+            return (name, None)
 
     async def test_search(self, game_name: str) -> dict:
-        """
-        测试搜索功能
-
-        Args:
-            game_name: 游戏名称
-
-        Returns:
-            {
-                "success": bool,
-                "message": str,
-                "summary": str,
-            }
-        """
+        """测试搜索功能"""
         if not self.enabled:
             return {
                 "success": False,
@@ -276,7 +261,7 @@ class SearchService:
         if result["status"] == "success":
             return {
                 "success": True,
-                "message": "搜索成功",
+                "message": f"搜索成功（来源：{result['provider']}）",
                 "summary": result["summary"][:500],
             }
         else:
