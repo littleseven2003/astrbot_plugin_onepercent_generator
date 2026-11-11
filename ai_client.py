@@ -33,6 +33,36 @@ INCOMPLETE_REASON_MESSAGES = {
     "steered": "❌ AI 回答被中途调整而中断，请重试",
 }
 
+# 上游 status / error.code 均视为不可信数据。只有明确列入白名单的已知
+# 枚举值才允许进入日志或异常，未知值统一替换为固定占位信息。
+KNOWN_RESPONSE_STATUSES = frozenset({
+    "completed",
+    "incomplete",
+    "failed",
+    "cancelled",
+    "canceled",
+    "queued",
+    "in_progress",
+})
+UNKNOWN_STATUS = "__unknown__"
+
+KNOWN_ERROR_CODES = frozenset({
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "rate_limit_error",
+    "server_error",
+    "api_error",
+    "insufficient_quota",
+    "invalid_api_key",
+    "model_not_found",
+    "context_length_exceeded",
+    "content_filter",
+    "billing_hard_limit_reached",
+    "rate_limit_exceeded",
+})
+
 
 class AIClientError(Exception):
     """AI 客户端错误基类"""
@@ -175,36 +205,75 @@ class AIClient:
 
     @staticmethod
     def _response_status(data: dict) -> str:
-        """读取 Responses API 顶层 status，缺失时返回空字符串。"""
-        raw = data.get("status")
-        return raw.strip().lower() if isinstance(raw, str) else ""
+        """返回白名单内的顶层 status。
 
-    @staticmethod
-    def _incomplete_reason(data: dict) -> str:
-        """读取 incomplete_details.reason，缺失或格式异常时返回空字符串。"""
-        details = data.get("incomplete_details")
-        if isinstance(details, dict):
-            reason = details.get("reason")
-            if isinstance(reason, str):
-                return reason.strip()
-        return ""
+        缺失返回空字符串；未知值返回 UNKNOWN_STATUS 占位，原始值不会进入
+        日志、异常或用户提示。
+        """
+        raw = data.get("status")
+        if raw is None:
+            return ""
+        if not isinstance(raw, str):
+            # 非字符串状态属于未知/异常值，安全拒绝，不回显原值。
+            return UNKNOWN_STATUS
+        status = raw.strip().lower()
+        if not status:
+            return ""
+        if status in KNOWN_RESPONSE_STATUSES:
+            return status
+        return UNKNOWN_STATUS
 
     @classmethod
-    def _has_incomplete_marker(cls, data: dict) -> bool:
-        """无顶层 status 时，识别显式的 incomplete 标记。"""
-        if cls._incomplete_reason(data):
-            return True
+    def _incomplete_reason(cls, data: dict) -> str:
+        """返回白名单内的 incomplete_details.reason，缺失或未知返回空字符串。"""
+        details = data.get("incomplete_details")
+        if not isinstance(details, dict):
+            return ""
+        raw = details.get("reason")
+        if not isinstance(raw, str):
+            return ""
+        reason = raw.strip()
+        return reason if reason in INCOMPLETE_REASON_MESSAGES else ""
+
+    @staticmethod
+    def _has_incomplete_details(data: dict) -> bool:
+        """是否存在 incomplete_details.reason（无论是否已知）。"""
+        details = data.get("incomplete_details")
+        return isinstance(details, dict) and bool(details.get("reason"))
+
+    def _check_message_item_statuses(self, data: dict) -> None:
+        """顶层无 status 时，校验 message 子项的明确状态。
+
+        规则：任一 message 子项显式标记为失败、未完成、取消或未知状态时，
+        整个响应按不可用处理，不返回任何部分正文；只有所有 message 子项
+        都缺失状态或为 completed 时，才允许拼接正文。
+        """
         for item in data.get("output") or []:
-            if isinstance(item, dict) and item.get("status") == "incomplete":
-                return True
-        return False
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            raw = item.get("status")
+            if not isinstance(raw, str):
+                continue
+            status = raw.strip().lower()
+            if not status or status == "completed":
+                continue
+            if status == "incomplete":
+                self._raise_response_incomplete(data)
+            elif status == "failed":
+                self._raise_response_failed(data)
+            elif status in {"cancelled", "canceled"}:
+                self._raise_response_cancelled()
+            elif status in {"queued", "in_progress"}:
+                self._raise_response_pending(status)
+            else:
+                self._raise_response_unknown_status()
 
     def _check_response_status(self, data: dict) -> None:
         """校验 Responses API 响应状态，避免把不完整正文当作成功。
 
-        兼容行为：部分兼容服务不返回 status。此时保持旧行为，只要正文可解析
-        即视为成功；但若存在显式 error 或 incomplete_details/output 标记，
-        仍按失败或不完整处理。
+        兼容行为：部分兼容服务不返回顶层 status。此时保持旧行为，只要正文
+        可解析即视为成功；但若存在显式 error、incomplete_details，或 message
+        子项明确标记为失败/未完成/取消/未知状态，仍按不可用处理。
         """
         if self.api_format != API_FORMAT_RESPONSES:
             return
@@ -213,8 +282,9 @@ class AIClient:
         if not status:
             if data.get("error"):
                 self._raise_response_failed(data)
-            if self._has_incomplete_marker(data):
+            if self._has_incomplete_details(data):
                 self._raise_response_incomplete(data)
+            self._check_message_item_statuses(data)
             return
 
         if status == "completed":
@@ -224,23 +294,10 @@ class AIClient:
         if status == "failed":
             self._raise_response_failed(data)
         if status in {"cancelled", "canceled"}:
-            logger.warning("[小作文生成器] Responses API 返回状态: %s", status)
-            raise AIClientResponseFailed(
-                f"Responses API status={status}",
-                "❌ AI 回答已被取消，请稍后重试",
-            )
+            self._raise_response_cancelled()
         if status in {"queued", "in_progress"}:
-            logger.warning("[小作文生成器] Responses API 返回状态: %s", status)
-            raise AIClientResponseFailed(
-                f"Responses API status={status}",
-                "❌ AI 回答尚未完成，请稍后重试",
-            )
-
-        logger.warning("[小作文生成器] Responses API 返回未知状态: %r", status)
-        raise AIClientResponseFailed(
-            f"Responses API status={status}",
-            "❌ AI 服务返回未知状态，请稍后重试",
-        )
+            self._raise_response_pending(status)
+        self._raise_response_unknown_status()
 
     def _raise_response_incomplete(self, data: dict) -> None:
         reason = self._incomplete_reason(data)
@@ -258,15 +315,15 @@ class AIClient:
         )
 
     def _raise_response_failed(self, data: dict) -> None:
-        # 只保留错误码字符，不记录或回显第三方 error.message，避免敏感信息泄漏。
+        # error.message 一律不读取；error.code 仅白名单值可进入日志/异常。
         code = ""
         error = data.get("error")
         if isinstance(error, dict):
-            raw_code = error.get("code")
-            if isinstance(raw_code, str):
-                code = "".join(
-                    ch for ch in raw_code if ch.isalnum() or ch in "_.-"
-                )[:64]
+            raw = error.get("code")
+            if isinstance(raw, str):
+                candidate = raw.strip()
+                if candidate in KNOWN_ERROR_CODES:
+                    code = candidate
         logger.warning(
             "[小作文生成器] Responses API 返回 failed，错误码: %s",
             code or "unknown",
@@ -274,6 +331,28 @@ class AIClient:
         raise AIClientResponseFailed(
             f"Responses API failed (code={code or 'unknown'})",
             "❌ AI 服务返回失败，请稍后重试",
+        )
+
+    def _raise_response_cancelled(self) -> None:
+        logger.warning("[小作文生成器] Responses API 返回状态: cancelled")
+        raise AIClientResponseFailed(
+            "Responses API status=cancelled",
+            "❌ AI 回答已被取消，请稍后重试",
+        )
+
+    def _raise_response_pending(self, status: str) -> None:
+        # 调用方只传入白名单内的 queued / in_progress。
+        logger.warning("[小作文生成器] Responses API 返回状态: %s", status)
+        raise AIClientResponseFailed(
+            f"Responses API status={status}",
+            "❌ AI 回答尚未完成，请稍后重试",
+        )
+
+    def _raise_response_unknown_status(self) -> None:
+        logger.warning("[小作文生成器] Responses API 返回未知状态")
+        raise AIClientResponseFailed(
+            "Responses API status=unknown",
+            "❌ AI 服务返回未知状态，请稍后重试",
         )
 
     def _extract_token_usage(self, data: dict) -> dict:
@@ -436,11 +515,12 @@ class AIClient:
             raise
 
         except Exception as e:
-            msg = f"AI 调用异常: {type(e).__name__}: {e}"
+            # 不拼接异常原文：响应体解析等异常可能携带上游数据。
+            msg = f"AI 调用异常: {type(e).__name__}"
             logger.error(f"[小作文生成器] {msg}")
             raise AIClientError(
                 msg,
-                f"❌ AI 生成失败：{str(e)}",
+                "❌ AI 生成失败，请稍后重试",
             )
 
     async def test_connection(self) -> dict:

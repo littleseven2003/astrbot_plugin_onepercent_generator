@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Responses API 状态校验与 temperature 兼容性测试。"""
+"""Responses API 状态校验、错误脱敏与 temperature 兼容性测试。"""
 
 import json
 import sys
@@ -17,6 +17,7 @@ from astrbot_plugin_onepercent_generator.ai_client import (  # noqa: E402
     AIClient,
     AIClientAPIError,
     AIClientEmptyResponse,
+    AIClientError,
     AIClientIncomplete,
     AIClientResponseFailed,
 )
@@ -333,6 +334,368 @@ class ErrorLeakTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(api_key, ctx.exception.user_message)
         self.assertNotIn(api_key, str(ctx.exception))
+
+
+class UntrustedResponseFieldTests(unittest.IsolatedAsyncioTestCase):
+    """上游响应字段必须脱敏，只有白名单枚举可进入日志/异常。"""
+
+    FAKE = "sk-FAKESECRET"
+
+    def _client(self, handler):
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="test-model",
+            api_format=API_FORMAT_RESPONSES,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def _run(self, body, exc_type):
+        async def handler(request):
+            return httpx.Response(200, json=body)
+
+        client = self._client(handler)
+        with self.assertLogs("astrbot", level="WARNING") as logs:
+            with self.assertRaises(exc_type) as ctx:
+                await client.generate("生成")
+        return ctx.exception, "\n".join(logs.output)
+
+    def _assert_clean(self, exc, log_text):
+        self.assertNotIn(self.FAKE, str(exc))
+        self.assertNotIn(self.FAKE, exc.user_message)
+        self.assertNotIn(self.FAKE, log_text)
+
+    async def test_unknown_top_level_status_not_echoed(self):
+        exc, logs = await self._run(
+            {"status": self.FAKE}, AIClientResponseFailed
+        )
+        self._assert_clean(exc, logs)
+        self.assertIn("未知状态", logs)
+        self.assertIn("未知状态", exc.user_message)
+
+    async def test_unknown_incomplete_reason_not_echoed(self):
+        exc, logs = await self._run(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": self.FAKE},
+            },
+            AIClientIncomplete,
+        )
+        self._assert_clean(exc, logs)
+        self.assertIn("不完整", exc.user_message)
+
+    async def test_unknown_error_code_not_echoed(self):
+        exc, logs = await self._run(
+            {
+                "status": "failed",
+                "error": {"code": self.FAKE, "message": "ignored"},
+            },
+            AIClientResponseFailed,
+        )
+        self._assert_clean(exc, logs)
+        self.assertIn("错误码: unknown", logs)
+
+    async def test_error_message_not_echoed(self):
+        exc, logs = await self._run(
+            {
+                "status": "failed",
+                "error": {"code": "server_error", "message": self.FAKE},
+            },
+            AIClientResponseFailed,
+        )
+        self._assert_clean(exc, logs)
+        self.assertIn("server_error", logs)
+
+    async def test_unknown_message_item_status_not_echoed(self):
+        exc, logs = await self._run(
+            {
+                "output": [{
+                    "type": "message",
+                    "status": self.FAKE,
+                    "content": [{"type": "output_text", "text": "部分正文"}],
+                }],
+            },
+            AIClientResponseFailed,
+        )
+        self._assert_clean(exc, logs)
+
+    async def test_non_string_status_is_rejected_without_echo(self):
+        exc, logs = await self._run(
+            {
+                "status": {"leak": self.FAKE},
+                "output_text": "部分正文",
+            },
+            AIClientResponseFailed,
+        )
+        self._assert_clean(exc, logs)
+
+    async def test_null_status_remains_compatible(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "status": None,
+                "output_text": "空状态兼容正文",
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "空状态兼容正文")
+
+    async def test_known_incomplete_reasons_have_specific_messages(self):
+        expectations = {
+            "max_output_tokens": "输出长度",
+            "max_messages": "消息数",
+            "content_filter": "内容安全过滤",
+            "steered": "中途调整",
+        }
+        for reason, keyword in expectations.items():
+            with self.subTest(reason=reason):
+                async def handler(request, _reason=reason):
+                    return httpx.Response(200, json={
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": _reason},
+                    })
+
+                with self.assertRaises(AIClientIncomplete) as ctx:
+                    await self._client(handler).generate("生成")
+                self.assertIn(keyword, ctx.exception.user_message)
+
+    async def test_unknown_reason_without_top_level_status_not_echoed(self):
+        exc, logs = await self._run(
+            {
+                "incomplete_details": {"reason": self.FAKE},
+                "output_text": "部分正文",
+            },
+            AIClientIncomplete,
+        )
+        self._assert_clean(exc, logs)
+
+
+class MessageItemStatusTests(unittest.IsolatedAsyncioTestCase):
+    """顶层无 status 时，message 子项状态决定整条响应是否可用。"""
+
+    def _client(self, handler):
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="test-model",
+            api_format=API_FORMAT_RESPONSES,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_unusable_item_status_rejects_partial_text(self):
+        cases = (
+            ("failed", AIClientResponseFailed),
+            ("incomplete", AIClientIncomplete),
+            ("queued", AIClientResponseFailed),
+            ("in_progress", AIClientResponseFailed),
+            ("cancelled", AIClientResponseFailed),
+            ("canceled", AIClientResponseFailed),
+        )
+        for status, exc_type in cases:
+            with self.subTest(status=status):
+                partial = "PARTIAL-ITEM-TEXT"
+
+                async def handler(request, _status=status, _partial=partial):
+                    return httpx.Response(200, json={
+                        "output": [{
+                            "type": "message",
+                            "status": _status,
+                            "content": [{
+                                "type": "output_text",
+                                "text": _partial,
+                            }],
+                        }],
+                    })
+
+                with self.assertRaises(exc_type) as ctx:
+                    await self._client(handler).generate("生成")
+
+                self.assertNotIn(partial, str(ctx.exception))
+                self.assertNotIn(partial, ctx.exception.user_message)
+
+    async def test_unknown_item_status_is_rejected_without_echo(self):
+        fake = "sk-FAKESECRET"
+
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [{
+                    "type": "message",
+                    "status": fake,
+                    "content": [{"type": "output_text", "text": "部分正文"}],
+                }],
+            })
+
+        with self.assertRaises(AIClientResponseFailed) as ctx:
+            await self._client(handler).generate("生成")
+
+        self.assertNotIn(fake, str(ctx.exception))
+        self.assertNotIn(fake, ctx.exception.user_message)
+
+    async def test_mixed_completed_and_incomplete_rejects_whole_response(self):
+        completed_text = "COMPLETED-TEXT"
+        partial_text = "PARTIAL-TEXT"
+
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": completed_text,
+                        }],
+                    },
+                    {
+                        "type": "message",
+                        "status": "incomplete",
+                        "content": [{
+                            "type": "output_text",
+                            "text": partial_text,
+                        }],
+                    },
+                ],
+            })
+
+        with self.assertRaises(AIClientIncomplete) as ctx:
+            await self._client(handler).generate("生成")
+
+        self.assertNotIn(completed_text, str(ctx.exception))
+        self.assertNotIn(partial_text, str(ctx.exception))
+        self.assertNotIn(completed_text, ctx.exception.user_message)
+        self.assertNotIn(partial_text, ctx.exception.user_message)
+
+    async def test_mixed_statusless_and_failed_rejects_whole_response(self):
+        ok_text = "OK-TEXT"
+
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": ok_text}],
+                    },
+                    {
+                        "type": "message",
+                        "status": "failed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "FAILED-TEXT",
+                        }],
+                    },
+                ],
+            })
+
+        with self.assertRaises(AIClientResponseFailed):
+            await self._client(handler).generate("生成")
+
+    async def test_all_completed_items_are_concatenated(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "第一段"}],
+                    },
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "第二段"}],
+                    },
+                ],
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "第一段\n第二段")
+
+    async def test_mixed_completed_and_statusless_succeeds(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "A"}],
+                    },
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "B"}],
+                    },
+                ],
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "A\nB")
+
+
+class AdminConnectionTests(unittest.IsolatedAsyncioTestCase):
+    """test_connection 的 success 与提示信息必须真实反映状态。"""
+
+    def _client(self, handler, api_key="test-key"):
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key=api_key,
+            model="test-model",
+            api_format=API_FORMAT_RESPONSES,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_connection_success(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "status": "completed",
+                "output_text": "连接正常",
+            })
+
+        result = await self._client(handler).test_connection()
+
+        self.assertTrue(result["success"])
+        self.assertIn("模型服务正常", result["message"])
+
+    async def test_connection_incomplete_returns_failure(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            })
+
+        result = await self._client(handler).test_connection()
+
+        self.assertFalse(result["success"])
+        self.assertIn("输出长度", result["message"])
+
+    async def test_connection_hides_untrusted_reason(self):
+        fake = "sk-FAKESECRET"
+
+        async def handler(request):
+            return httpx.Response(200, json={
+                "status": "incomplete",
+                "incomplete_details": {"reason": fake},
+            })
+
+        result = await self._client(handler).test_connection()
+
+        self.assertFalse(result["success"])
+        self.assertNotIn(fake, result["message"])
+        self.assertIn("不完整", result["message"])
+
+    async def test_connection_http_error_returns_failure_without_key(self):
+        api_key = "sk-http-secret-999"
+
+        async def handler(request):
+            return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+        result = await self._client(handler, api_key=api_key).test_connection()
+
+        self.assertFalse(result["success"])
+        self.assertIn("API Key 无效", result["message"])
+        self.assertNotIn(api_key, result["message"])
 
 
 if __name__ == "__main__":
