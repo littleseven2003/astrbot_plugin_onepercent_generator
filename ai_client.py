@@ -24,6 +24,15 @@ SUPPORTED_API_FORMATS = {
     API_FORMAT_RESPONSES,
 }
 
+# Responses API 的 incomplete_details.reason 到用户可理解提示的映射。
+# 仅使用官方枚举值，不拼接第三方响应中的原始文本。
+INCOMPLETE_REASON_MESSAGES = {
+    "max_output_tokens": "❌ AI 回答达到最大输出长度而被截断，请重试或缩短输入内容",
+    "max_messages": "❌ AI 回答达到最大消息数限制而中断，请重试",
+    "content_filter": "❌ AI 回答因内容安全过滤而中断，请调整输入后重试",
+    "steered": "❌ AI 回答被中途调整而中断，请重试",
+}
+
 
 class AIClientError(Exception):
     """AI 客户端错误基类"""
@@ -45,6 +54,18 @@ class AIClientAPIError(AIClientError):
     """API 返回错误"""
 
 
+class AIClientIncomplete(AIClientError):
+    """Responses API 明确返回 incomplete，正文不完整"""
+
+
+class AIClientResponseFailed(AIClientError):
+    """Responses API 返回 failed、取消或未完成等不可用状态"""
+
+
+class AIClientEmptyResponse(AIClientError):
+    """请求成功但服务未返回可用正文"""
+
+
 class AIClient:
     """AI API 客户端，兼容 OpenAI Chat Completions 与 Responses 格式"""
 
@@ -54,6 +75,7 @@ class AIClient:
         api_key: str,
         model: str,
         api_format: str = API_FORMAT_CHAT_COMPLETIONS,
+        send_temperature: bool = True,
     ):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
@@ -68,6 +90,11 @@ class AIClient:
             )
             normalized_format = API_FORMAT_CHAT_COMPLETIONS
         self.api_format = normalized_format
+        # 默认发送 temperature，保持旧配置行为；非布尔值回退为 True。
+        # 部分推理模型不接受 temperature，可由配置显式关闭。
+        self.send_temperature = (
+            send_temperature if isinstance(send_temperature, bool) else True
+        )
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -87,26 +114,34 @@ class AIClient:
         temperature: float,
         max_tokens: int,
     ) -> tuple[str, dict]:
-        """根据配置构造 API 地址与请求体。"""
+        """根据配置构造 API 地址与请求体。
+
+        send_temperature 为 False 时，两种 API 格式都不发送 temperature，
+        其余字段保持不变。
+        """
         if self.api_format == API_FORMAT_RESPONSES:
-            return f"{self.base_url}/responses", {
+            payload = {
                 "model": self.model,
                 "instructions": system_prompt,
                 "input": user_prompt,
-                "temperature": temperature,
                 "max_output_tokens": max_tokens,
                 "store": False,
             }
+            if self.send_temperature:
+                payload["temperature"] = temperature
+            return f"{self.base_url}/responses", payload
 
-        return f"{self.base_url}/chat/completions", {
+        payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.send_temperature:
+            payload["temperature"] = temperature
+        return f"{self.base_url}/chat/completions", payload
 
     def _extract_content(self, data: dict) -> str:
         """从不同 API 格式的响应中提取最终文本。"""
@@ -122,10 +157,10 @@ class AIClient:
             return output_text
 
         text_parts = []
-        for item in data.get("output", []):
+        for item in data.get("output") or []:
             if not isinstance(item, dict) or item.get("type") != "message":
                 continue
-            for content_item in item.get("content", []):
+            for content_item in item.get("content") or []:
                 if not isinstance(content_item, dict):
                     continue
                 if content_item.get("type") not in {"output_text", "text"}:
@@ -137,6 +172,109 @@ class AIClient:
         if not text_parts:
             raise ValueError("Responses API 响应中没有可用的文本输出")
         return "\n".join(text_parts)
+
+    @staticmethod
+    def _response_status(data: dict) -> str:
+        """读取 Responses API 顶层 status，缺失时返回空字符串。"""
+        raw = data.get("status")
+        return raw.strip().lower() if isinstance(raw, str) else ""
+
+    @staticmethod
+    def _incomplete_reason(data: dict) -> str:
+        """读取 incomplete_details.reason，缺失或格式异常时返回空字符串。"""
+        details = data.get("incomplete_details")
+        if isinstance(details, dict):
+            reason = details.get("reason")
+            if isinstance(reason, str):
+                return reason.strip()
+        return ""
+
+    @classmethod
+    def _has_incomplete_marker(cls, data: dict) -> bool:
+        """无顶层 status 时，识别显式的 incomplete 标记。"""
+        if cls._incomplete_reason(data):
+            return True
+        for item in data.get("output") or []:
+            if isinstance(item, dict) and item.get("status") == "incomplete":
+                return True
+        return False
+
+    def _check_response_status(self, data: dict) -> None:
+        """校验 Responses API 响应状态，避免把不完整正文当作成功。
+
+        兼容行为：部分兼容服务不返回 status。此时保持旧行为，只要正文可解析
+        即视为成功；但若存在显式 error 或 incomplete_details/output 标记，
+        仍按失败或不完整处理。
+        """
+        if self.api_format != API_FORMAT_RESPONSES:
+            return
+
+        status = self._response_status(data)
+        if not status:
+            if data.get("error"):
+                self._raise_response_failed(data)
+            if self._has_incomplete_marker(data):
+                self._raise_response_incomplete(data)
+            return
+
+        if status == "completed":
+            return
+        if status == "incomplete":
+            self._raise_response_incomplete(data)
+        if status == "failed":
+            self._raise_response_failed(data)
+        if status in {"cancelled", "canceled"}:
+            logger.warning("[小作文生成器] Responses API 返回状态: %s", status)
+            raise AIClientResponseFailed(
+                f"Responses API status={status}",
+                "❌ AI 回答已被取消，请稍后重试",
+            )
+        if status in {"queued", "in_progress"}:
+            logger.warning("[小作文生成器] Responses API 返回状态: %s", status)
+            raise AIClientResponseFailed(
+                f"Responses API status={status}",
+                "❌ AI 回答尚未完成，请稍后重试",
+            )
+
+        logger.warning("[小作文生成器] Responses API 返回未知状态: %r", status)
+        raise AIClientResponseFailed(
+            f"Responses API status={status}",
+            "❌ AI 服务返回未知状态，请稍后重试",
+        )
+
+    def _raise_response_incomplete(self, data: dict) -> None:
+        reason = self._incomplete_reason(data)
+        user_message = INCOMPLETE_REASON_MESSAGES.get(
+            reason,
+            "❌ AI 回答不完整，请重试",
+        )
+        logger.warning(
+            "[小作文生成器] Responses API 返回 incomplete，原因: %s",
+            reason or "unknown",
+        )
+        raise AIClientIncomplete(
+            f"Responses API incomplete (reason={reason or 'unknown'})",
+            user_message,
+        )
+
+    def _raise_response_failed(self, data: dict) -> None:
+        # 只保留错误码字符，不记录或回显第三方 error.message，避免敏感信息泄漏。
+        code = ""
+        error = data.get("error")
+        if isinstance(error, dict):
+            raw_code = error.get("code")
+            if isinstance(raw_code, str):
+                code = "".join(
+                    ch for ch in raw_code if ch.isalnum() or ch in "_.-"
+                )[:64]
+        logger.warning(
+            "[小作文生成器] Responses API 返回 failed，错误码: %s",
+            code or "unknown",
+        )
+        raise AIClientResponseFailed(
+            f"Responses API failed (code={code or 'unknown'})",
+            "❌ AI 服务返回失败，请稍后重试",
+        )
 
     def _extract_token_usage(self, data: dict) -> dict:
         """将不同 API 格式的 Token 统计归一化。"""
@@ -238,7 +376,15 @@ class AIClient:
             resp.raise_for_status()
             data = resp.json()
 
-            content = self._extract_content(data)
+            self._check_response_status(data)
+            try:
+                content = self._extract_content(data)
+            except ValueError as e:
+                logger.error("[小作文生成器] AI 响应没有可用正文: %s", e)
+                raise AIClientEmptyResponse(
+                    f"AI 响应正文为空: {e}",
+                    "❌ AI 服务未返回有效内容，请稍后重试",
+                )
             duration_ms = int((time.time() - start_time) * 1000)
 
             token_usage = self._extract_token_usage(data)
@@ -285,6 +431,9 @@ class AIClient:
                 msg,
                 f"❌ AI 调用失败：{detail}",
             )
+
+        except AIClientError:
+            raise
 
         except Exception as e:
             msg = f"AI 调用异常: {type(e).__name__}: {e}"

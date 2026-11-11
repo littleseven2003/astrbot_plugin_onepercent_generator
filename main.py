@@ -36,6 +36,7 @@ class OnePercentGenerator(Star):
             api_key=ai_cfg.get("api_key", ""),
             model=ai_cfg.get("model", "deepseek-chat"),
             api_format=ai_cfg.get("api_format", "chat_completions"),
+            send_temperature=ai_cfg.get("send_temperature", True),
         )
 
         # 搜索配置
