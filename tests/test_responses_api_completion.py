@@ -534,6 +534,107 @@ class MessageItemStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(fake, str(ctx.exception))
         self.assertNotIn(fake, ctx.exception.user_message)
 
+    async def test_non_string_item_status_rejected(self):
+        cases = (
+            ("object", {"bad": True}),
+            ("array", ["bad"]),
+            ("number", 42),
+            ("boolean", True),
+        )
+        for name, value in cases:
+            with self.subTest(kind=name):
+                partial = "PARTIAL-NONSTRING-TEXT"
+
+                async def handler(request, _value=value, _partial=partial):
+                    return httpx.Response(200, json={
+                        "output": [{
+                            "type": "message",
+                            "status": _value,
+                            "content": [{
+                                "type": "output_text",
+                                "text": _partial,
+                            }],
+                        }],
+                    })
+
+                with self.assertRaises(AIClientResponseFailed) as ctx:
+                    await self._client(handler).generate("生成")
+
+                self.assertNotIn(partial, str(ctx.exception))
+                self.assertNotIn(partial, ctx.exception.user_message)
+
+    async def test_non_string_item_status_sensitive_value_not_echoed(self):
+        fake = "sk-FAKESECRET"
+        for name, value in (("object", {"bad": fake}), ("array", [fake])):
+            with self.subTest(kind=name):
+                async def handler(request, _value=value):
+                    return httpx.Response(200, json={
+                        "output": [{
+                            "type": "message",
+                            "status": _value,
+                            "content": [{
+                                "type": "output_text",
+                                "text": "部分正文",
+                            }],
+                        }],
+                    })
+
+                with self.assertLogs("astrbot", level="WARNING") as logs:
+                    with self.assertRaises(AIClientResponseFailed) as ctx:
+                        await self._client(handler).generate("生成")
+
+                log_text = "\n".join(logs.output)
+                self.assertNotIn(fake, str(ctx.exception))
+                self.assertNotIn(fake, ctx.exception.user_message)
+                self.assertNotIn(fake, log_text)
+
+    async def test_null_item_status_is_treated_as_absent(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [{
+                    "type": "message",
+                    "status": None,
+                    "content": [{
+                        "type": "output_text",
+                        "text": "null 状态兼容正文",
+                    }],
+                }],
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "null 状态兼容正文")
+
+    async def test_missing_item_status_remains_compatible(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "缺少状态兼容正文",
+                    }],
+                }],
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "缺少状态兼容正文")
+
+    async def test_blank_item_status_is_treated_as_absent(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "output": [{
+                    "type": "message",
+                    "status": "   ",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "空白状态兼容正文",
+                    }],
+                }],
+            })
+
+        result = await self._client(handler).generate("生成")
+        self.assertEqual(result["content"], "空白状态兼容正文")
+
     async def test_mixed_completed_and_incomplete_rejects_whole_response(self):
         completed_text = "COMPLETED-TEXT"
         partial_text = "PARTIAL-TEXT"

@@ -244,16 +244,29 @@ class AIClient:
     def _check_message_item_statuses(self, data: dict) -> None:
         """顶层无 status 时，校验 message 子项的明确状态。
 
-        规则：任一 message 子项显式标记为失败、未完成、取消或未知状态时，
-        整个响应按不可用处理，不返回任何部分正文；只有所有 message 子项
-        都缺失状态或为 completed 时，才允许拼接正文。
+        规则：
+        - 缺少 status：视为未提供状态，保持兼容；
+        - status 为 null：明确按未提供状态处理，保持兼容；
+        - status 为空白字符串：按未提供状态处理，保持既有兼容行为；
+        - status 为非字符串（对象、数组、数字、布尔等）：安全拒绝；
+        - status 为未知字符串：安全拒绝；
+        - 已知的失败/未完成/取消状态：整条响应拒绝。
+
+        任一 message 子项不可用时，整个响应按不可用处理，不返回任何部分
+        正文；只有所有 message 子项都未提供状态或为 completed 时，才允许
+        拼接正文。
         """
         for item in data.get("output") or []:
             if not isinstance(item, dict) or item.get("type") != "message":
                 continue
-            raw = item.get("status")
-            if not isinstance(raw, str):
+            if "status" not in item:
                 continue
+            raw = item["status"]
+            if raw is None:
+                continue
+            if not isinstance(raw, str):
+                # 不对异常类型的原始值做任何格式化，避免敏感内容回显。
+                self._raise_response_unknown_status()
             status = raw.strip().lower()
             if not status or status == "completed":
                 continue
