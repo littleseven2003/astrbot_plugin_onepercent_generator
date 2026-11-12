@@ -742,6 +742,25 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Baidu Snippet</div>'
         '</div></body></html>'
     )
+    BAIDU_CONTAINER_ONLY = (
+        '<html><body><div class="c-container"><h3>'
+        '<a href="https://example.com/container">Container Only</a></h3>'
+        '<div class="c-abstract">Container Snippet</div></div></body></html>'
+    )
+    BAIDU_RESULT_ONLY = (
+        '<html><body><div class="result"><h3>'
+        '<a href="https://example.com/result-only">Result Only</a></h3>'
+        '<div class="c-abstract">Result Snippet</div></div></body></html>'
+    )
+    BAIDU_OUTER_RESULT = (
+        '<html><body><div class="result">'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/outer-a">Outer A</a></h3></div>'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/outer-b">Outer B</a></h3>'
+        '<div class="c-abstract">Outer B Snippet</div></div>'
+        '</div></body></html>'
+    )
     BAIDU_NESTED = (
         '<html><body><div class="c-container">'
         '<div class="result"><h3>'
@@ -1406,6 +1425,46 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             {item["source"] for item in baidu_result["results"]}, {"baidu"}
         )
 
+    async def test_baidu_container_matrix(self):
+        cases = [
+            (self.BAIDU_CONTAINER_ONLY, ["Container Only"], "Container Snippet"),
+            (self.BAIDU_RESULT_ONLY, ["Result Only"], "Result Snippet"),
+            (self.BAIDU_OK, ["Baidu Title"], "Baidu Snippet"),
+        ]
+        for html, titles, snippet_text in cases:
+            with self.subTest(titles=titles):
+                async def handler(request, page=html):
+                    if request.url.host == "www.bing.com":
+                        return httpx.Response(429, text="rate limited")
+                    return httpx.Response(200, text=page)
+
+                result = await self._service(handler).search_game_info("游戏")
+                self.assertEqual(result["status"], "success")
+                self.assertEqual(
+                    [item["title"] for item in result["results"]], titles
+                )
+                self.assertEqual(
+                    result["results"][0]["snippet"], snippet_text
+                )
+
+    async def test_baidu_outer_result_keeps_child_results(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_OUTER_RESULT)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Outer A", "Outer B"],
+        )
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertEqual(
+            result["results"][1]["snippet"], "Outer B Snippet"
+        )
+
     async def test_baidu_outer_container_keeps_child_results(self):
         async def handler(request):
             if request.url.host == "www.bing.com":
@@ -1636,6 +1695,23 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
 
+    def test_three_short_items_budget_50_keep_multiple(self):
+        results = [
+            item(
+                title=title,
+                url="",
+                snippet=f"Fact {title}",
+                source=f"s{index}",
+            )
+            for index, title in enumerate(["A", "B", "C"])
+        ]
+        text = build_search_summary(results, max_total_chars=50)
+
+        self.assertLessEqual(len(text), 50)
+        for title in ("A", "B", "C"):
+            self.assertIn(f"[s{'ABC'.index(title)}] {title}", text)
+            self.assertIn(f"Fact {title}", text)
+
     def test_ten_results_budget_50_uses_few_readable_items(self):
         results = [
             item(
@@ -1649,10 +1725,11 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         text = build_search_summary(results, max_total_chars=50)
 
         self.assertLessEqual(len(text), 50)
-        self.assertNotIn("\n\n", text)
-        self.assertIn("[source0]", text)
+        self.assertIn("\n\n", text)
         self.assertIn("Result-0", text)
-        self.assertNotIn("Result-1", text)
+        self.assertIn("Result-1", text)
+        self.assertNotIn("Result-2", text)
+        self.assertNotIn("[source", text)
 
     def test_ten_results_budget_50_source_labels_are_not_partial(self):
         results = [
@@ -1727,6 +1804,37 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"[s{index}]", text)
             self.assertIn(f"-END-{index}", text)
         self.assertIn("Short", text)
+
+    def test_mixed_summary_lengths_and_unicode(self):
+        results = [
+            item(
+                title="长标题一" + "甲" * 200,
+                url="https://例子.测试/" + "路径" * 1000,
+                snippet="长摘要" * 500,
+                source="来源一",
+            ),
+            item(
+                title="短标题二",
+                url="https://example.com/short",
+                snippet="短摘要",
+                source="来源二",
+            ),
+            item(
+                title="空摘要三",
+                url="https://example.com/empty",
+                snippet="",
+                source="来源三",
+            ),
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        self.assertIn("长标题一", text)
+        self.assertIn("短标题二", text)
+        self.assertIn("空摘要三", text)
+        self.assertIn("短摘要", text)
+        self.assertNotIn("https://例子.测试/", text)
+        self.assertLessEqual(len(text), 200)
 
     def test_first_long_item_does_not_hide_later_items(self):
         results = [

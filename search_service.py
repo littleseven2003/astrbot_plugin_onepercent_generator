@@ -142,8 +142,8 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[:limit]
 
 
-MIN_SUMMARY_ITEM_BUDGET = 32
-MIN_SUMMARY_HEADER_BUDGET = 18
+MIN_SUMMARY_TITLE_CHARS = 10
+MIN_SUMMARY_TITLE_WITH_SOURCE = 16
 
 
 def _truncate_title(text: str, max_chars: int) -> str:
@@ -177,7 +177,8 @@ def _summary_header(source: str, title: str, budget: int) -> str:
     """来源标签必须完整；放不下标签时直接省略，不输出半截标签。"""
     budget = max(1, int(budget))
     label = f"[{source}] " if source else ""
-    if label and len(label) + 6 <= budget:
+    needed_title = min(len(title), MIN_SUMMARY_TITLE_WITH_SOURCE)
+    if label and len(label) + needed_title <= budget:
         return label + _truncate_title(title, budget - len(label))
     return _truncate_title(title, budget)
 
@@ -283,46 +284,57 @@ def build_search_summary(
         total = DEFAULT_SUMMARY_INPUT_MAX_CHARS
     total = max(1, total)
 
-    # 空间不足时先减少结果条数，而不是给每条留下标签/单字符碎片。
+    # 以实际标题/来源长度决定能保留多少条，而不是固定假设每条 32 字。
+    min_headers = []
+    for source, title, _snippet, _url in items:
+        label = f"[{source}] " if source else ""
+        min_headers.append(
+            len(label) + min(len(title), MIN_SUMMARY_TITLE_CHARS)
+        )
+
     selected_count = 1
     for candidate in range(len(items), 0, -1):
         if (
-            candidate * MIN_SUMMARY_ITEM_BUDGET
-            + 2 * (candidate - 1)
+            sum(min_headers[:candidate]) + 2 * (candidate - 1)
             <= total
         ):
             selected_count = candidate
             break
     items = items[:selected_count]
+    min_headers = min_headers[:selected_count]
     count = len(items)
     separators = 2 * (count - 1)
     available = total - separators
 
-    # 摘要预留按实际需要申请，且不能吃掉每条结果的最低标题预算。
+    # 摘要按实际长度申请，且不能吃掉已选条目的最低标题空间。
     snippet_need = sum(
         1 + min(len(item[2]), MAX_SNIPPET_CHARS)
         for item in items
         if item[2]
     )
-    # 选择条数时用较高的可识别门槛；真正分配时标题可以降到
-    # 18 字左右，给多条摘要保留合理空间。
-    max_reserve = max(
-        0, available - count * MIN_SUMMARY_HEADER_BUDGET
-    )
+    max_reserve = max(0, available - sum(min_headers))
     snippet_reserve = min(
         int(available * 0.4), snippet_need, max_reserve
     )
-    header_available = min(
-        available,
-        max(
-            count * MIN_SUMMARY_HEADER_BUDGET,
-            available - snippet_reserve,
-        ),
-    )
-    header_share = max(1, header_available // count)
+    header_available = available - snippet_reserve
+    if header_available <= sum(min_headers):
+        base, remainder = divmod(header_available, count)
+        header_budgets = [
+            max(1, base + (1 if index < remainder else 0))
+            for index in range(count)
+        ]
+    else:
+        extra_header = header_available - sum(min_headers)
+        base_extra, remainder = divmod(extra_header, count)
+        header_budgets = [
+            min_budget + base_extra + (1 if index < remainder else 0)
+            for index, min_budget in enumerate(min_headers)
+        ]
     headers = [
-        _summary_header(source, title, header_share)
-        for source, title, _snippet, _url in items
+        _summary_header(source, title, budget)
+        for (source, title, _snippet, _url), budget in zip(
+            items, header_budgets
+        )
     ]
 
     blocks = list(headers)
@@ -898,22 +910,10 @@ class _BingResultParser(HTMLParser):
             self.snippet_parts.append(data)
 
 
-class _BaiduResultParser(HTMLParser):
-    """在 Baidu result/c-container 容器内收集标题、URL、摘要。
-
-    摘要只接受容器内 c-abstract/abstract；容器外的 content-right 广告
-    不会进入当前结果。容器内缺少摘要时留空，不向后拼接。
-    """
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.div_depth = 0
-        self.result_depth: int | None = None
-        self.tag_depth: dict[str, int] = {}
-        self.results: list[dict] = []
-        self._reset_result()
-
-    def _reset_result(self):
+class _BaiduResultFrame:
+    def __init__(self, depth: int):
+        self.depth = depth
+        self.group = False
         self.in_title = False
         self.title_anchor_seen = False
         self.title_parts: list[str] = []
@@ -926,57 +926,83 @@ class _BaiduResultParser(HTMLParser):
         self.snippet = ""
         self.snippet_found = False
 
+
+class _BaiduResultParser(HTMLParser):
+    """按容器栈解析 Baidu 结果。
+
+    规则矩阵：
+    - 单独 result：叶子结果；
+    - 单独 c-container：叶子结果；
+    - result + c-container 同一元素：一个叶子结果；
+    - 外层 c-container/result 含内层 result：外层是分组容器，内层叶子
+      分别成为结果，外层自身的标题/摘要不参与归属；
+    - 无子结果容器的 c-container 才按叶子结果解析。
+
+    摘要只接受当前叶子容器内 c-abstract/abstract；外层分组、容器外
+    content-right 广告和相邻结果都不会被拼入。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.div_depth = 0
+        self.tag_depth: dict[str, int] = {}
+        self.stack: list[_BaiduResultFrame] = []
+        self.results: list[dict] = []
+
     @staticmethod
-    def _is_result_start(attrs) -> bool:
+    def _is_candidate(attrs) -> bool:
         classes = (dict(attrs).get("class") or "").split()
-        # 外层 c-container 可能包住多个 result，只有 result 才是结果边界。
-        return "result" in classes
+        return "result" in classes or "c-container" in classes
 
-    def _finish_title(self):
-        self.in_title = False
+    def _finish_title(self, frame: _BaiduResultFrame):
+        frame.in_title = False
 
-    def _finish_snippet(self):
-        if not self.in_snippet:
+    def _finish_snippet(self, frame: _BaiduResultFrame):
+        if not frame.in_snippet:
             return
-        text = "".join(self.snippet_parts).strip()
-        if text and not self.snippet_found:
-            self.snippet = text
-            self.snippet_found = True
-        self.in_snippet = False
-        self.snippet_tag = None
-        self.snippet_parts = []
+        text = "".join(frame.snippet_parts).strip()
+        if text and not frame.snippet_found:
+            frame.snippet = text
+            frame.snippet_found = True
+        frame.in_snippet = False
+        frame.snippet_tag = None
+        frame.snippet_parts = []
 
-    def _finish_result(self):
-        self._finish_title()
-        self._finish_snippet()
-        title = "".join(self.title_parts).strip()
+    def _finish_frame(self, frame: _BaiduResultFrame):
+        if frame.group:
+            return
+        self._finish_title(frame)
+        self._finish_snippet(frame)
+        title = "".join(frame.title_parts).strip()
         if title:
             self.results.append({
                 "title": title,
-                "url": self.url,
-                "snippet": self.snippet,
+                "url": frame.url,
+                "snippet": frame.snippet,
             })
 
     def handle_starttag(self, tag, attrs):
         self.tag_depth[tag] = self.tag_depth.get(tag, 0) + 1
         if tag == "div":
             self.div_depth += 1
-            if (
-                self.result_depth is None
-                and self._is_result_start(attrs)
-            ):
-                self.result_depth = self.div_depth
-                self._reset_result()
+            if self._is_candidate(attrs):
+                if self.stack:
+                    self.stack[-1].group = True
+                self.stack.append(_BaiduResultFrame(self.div_depth))
+                return
 
-        if self.result_depth is None:
+        if not self.stack:
+            return
+        frame = self.stack[-1]
+        if frame.group:
             return
         if tag == "h3":
-            self.h3_depth += 1
+            frame.h3_depth += 1
             return
         if (
             tag == "a"
-            and self.h3_depth > 0
-            and not self.title_anchor_seen
+            and frame.h3_depth > 0
+            and not frame.title_anchor_seen
         ):
             href = str(dict(attrs).get("href") or "").strip()
             if (
@@ -988,38 +1014,48 @@ class _BaiduResultParser(HTMLParser):
             resolved = urljoin("https://www.baidu.com", href)
             if not _is_http_url(resolved):
                 return
-            self.title_anchor_seen = True
-            self.in_title = True
-            self.title_parts = []
-            self.url = resolved
+            frame.title_anchor_seen = True
+            frame.in_title = True
+            frame.title_parts = []
+            frame.url = resolved
             return
 
         classes = (dict(attrs).get("class") or "").split()
         if (
             ("c-abstract" in classes or "abstract" in classes)
-            and not self.in_snippet
-            and not self.snippet_found
+            and not frame.in_snippet
+            and not frame.snippet_found
         ):
-            self.in_snippet = True
-            self.snippet_tag = tag
-            self.snippet_tag_depth = self.tag_depth.get(tag, 0)
-            self.snippet_parts = []
+            frame.in_snippet = True
+            frame.snippet_tag = tag
+            frame.snippet_tag_depth = self.tag_depth.get(tag, 0)
+            frame.snippet_parts = []
 
     def handle_endtag(self, tag):
-        if self.result_depth is not None:
-            if tag == "a" and self.in_title:
-                self._finish_title()
-            elif tag == "h3":
-                self.h3_depth = max(0, self.h3_depth - 1)
-            if (
-                tag == self.snippet_tag
-                and self.in_snippet
-                and self.tag_depth.get(tag, 0) == self.snippet_tag_depth
-            ):
-                self._finish_snippet()
-            if tag == "div" and self.div_depth == self.result_depth:
-                self._finish_result()
-                self.result_depth = None
+        if (
+            tag == "div"
+            and self.stack
+            and self.div_depth == self.stack[-1].depth
+        ):
+            self._finish_frame(self.stack.pop())
+            self.tag_depth[tag] = max(0, self.tag_depth.get(tag, 0) - 1)
+            self.div_depth = max(0, self.div_depth - 1)
+            return
+
+        if self.stack:
+            frame = self.stack[-1]
+            if not frame.group:
+                if tag == "a" and frame.in_title:
+                    self._finish_title(frame)
+                elif tag == "h3":
+                    frame.h3_depth = max(0, frame.h3_depth - 1)
+                if (
+                    tag == frame.snippet_tag
+                    and frame.in_snippet
+                    and self.tag_depth.get(tag, 0)
+                    == frame.snippet_tag_depth
+                ):
+                    self._finish_snippet(frame)
 
         if self.tag_depth.get(tag, 0) > 0:
             self.tag_depth[tag] -= 1
@@ -1027,10 +1063,15 @@ class _BaiduResultParser(HTMLParser):
             self.div_depth = max(0, self.div_depth - 1)
 
     def handle_data(self, data):
-        if self.in_title:
-            self.title_parts.append(data)
-        if self.in_snippet:
-            self.snippet_parts.append(data)
+        if not self.stack:
+            return
+        frame = self.stack[-1]
+        if frame.group:
+            return
+        if frame.in_title:
+            frame.title_parts.append(data)
+        if frame.in_snippet:
+            frame.snippet_parts.append(data)
 
 
 class WebSearchBackend(SearchBackend):

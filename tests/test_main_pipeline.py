@@ -243,8 +243,14 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_ai.summarize_calls), 1)
         self.assertEqual(len(fake_ai.prompts), 1)
         expected = ("AI" * 200)[:40]
-        self.assertIn(expected, fake_ai.prompts[0])
-        self.assertNotIn("AI" * 200, fake_ai.prompts[0])
+        prompt = fake_ai.prompts[0]
+        self.assertIn(expected, prompt)
+        self.assertNotIn("AI" * 200, prompt)
+        marker = "联网搜索到的游戏信息摘要：\n"
+        digest = prompt.split(marker, 1)[1].split(
+            "\n\n需要自动生成的字段：", 1
+        )[0]
+        self.assertLessEqual(len(digest), 40)
         self.assertTrue(event.stopped)
         self.assertTrue(any(m["text"].startswith("什么是【我的百分之一】")
                             for m in messages))
