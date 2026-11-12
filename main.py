@@ -11,7 +11,11 @@ from astrbot.api.star import Context, Star, register
 
 from .ai_client import AIClient, AIClientError
 from .post_process import build_final_message
-from .prompt import build_main_prompt
+from .prompt import (
+    build_main_prompt,
+    choose_writing_variant,
+    parse_writing_request,
+)
 from .rate_limiter import RateLimiter
 from .search_service import SearchService
 from .whitelist import is_session_allowed
@@ -98,28 +102,9 @@ class OnePercentGenerator(Star):
         return random.choice(self.preset_games)
 
     def _match_keyword(self, text: str) -> tuple[bool, str]:
-        """
-        匹配关键词
-
-        Returns:
-            (matched, game_name)
-            - matched: 是否匹配到关键词
-            - game_name: 游戏名称（空字符串表示随机选择）
-        """
-        text = text.strip()
-
-        # 精确匹配 → 随机游戏
-        if text in ("小作文", "我的百分之一"):
-            return True, ""
-
-        # 前缀匹配 → 指定游戏
-        for prefix in ("小作文 ", "我的百分之一 "):
-            if text.startswith(prefix):
-                game_name = text[len(prefix):].strip()
-                if game_name:
-                    return True, game_name
-
-        return False, ""
+        """兼容旧调用：只返回是否匹配和游戏名。"""
+        matched, game_name, _experience = parse_writing_request(text)
+        return matched, game_name
 
     # ========================================================================
     # 消息监听：关键词触发生成
@@ -129,7 +114,7 @@ class OnePercentGenerator(Star):
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，匹配关键词触发"""
         text = event.message_str.strip()
-        matched, game_name = self._match_keyword(text)
+        matched, game_name, experience = parse_writing_request(text)
 
         if not matched:
             return
@@ -183,8 +168,14 @@ class OnePercentGenerator(Star):
             # 未启用搜索汇总，直接使用原始搜索结果
             search_digest = raw_summary[:self.search_summarize_max_chars]
 
-        # 组装 Prompt（使用搜索汇总作为参考）
-        prompt = build_main_prompt(game_name, search_digest or raw_summary)
+        # 组装 Prompt：搜索资料只作参考，真实经历由用户显式提供；
+        # 写作风格随机选择，但不改变游戏名或事实边界。
+        prompt = build_main_prompt(
+            game_name,
+            search_digest or raw_summary,
+            experience=experience,
+            variant=choose_writing_variant(random),
+        )
 
         # 调用 AI 生成小作文
         try:
