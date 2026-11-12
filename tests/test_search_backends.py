@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import time
 import types
@@ -282,6 +283,39 @@ class AutoOrderTests(unittest.IsolatedAsyncioTestCase):
         await svc.close()
 
 
+class TwoPhaseBackend(SearchBackend):
+    def __init__(
+        self,
+        name,
+        availability_delay=0.0,
+        search_delay=0.0,
+        results=None,
+    ):
+        self.name = name
+        self.availability_delay = availability_delay
+        self.search_delay = search_delay
+        self.results = list(results or [])
+        self.search_timeout_s = None
+        self.availability_cancelled = False
+
+    async def availability(self, event=None):
+        try:
+            if self.availability_delay:
+                await asyncio.sleep(self.availability_delay)
+        except asyncio.CancelledError:
+            self.availability_cancelled = True
+            raise
+        return True, ""
+
+    async def search(self, query, max_results, event=None, timeout_s=None):
+        self.search_timeout_s = timeout_s
+        if self.search_delay:
+            await asyncio.sleep(self.search_delay)
+        return BackendResult(
+            self.name, "success", self.results[:max_results], "", 0
+        )
+
+
 class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_total_budget_not_per_backend(self):
         first = FakeBackend("api", status="no_results",
@@ -332,6 +366,51 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.5)
         await svc.close()
 
+    async def test_two_phases_share_one_backend_budget(self):
+        first = TwoPhaseBackend(
+            "api", availability_delay=0.12, search_delay=1.0,
+            results=[item()],
+        )
+        second = TwoPhaseBackend(
+            "web", availability_delay=0.0, search_delay=0.01,
+            results=[item(source="bing")],
+        )
+        svc = fake_service(
+            {"api": first, "web": second},
+            mode="api",
+            fallback_enabled=True,
+            timeout_ms=800,
+            per_backend_timeout_ms=300,
+        )
+        start = time.monotonic()
+        result = await svc.search_game_info("游戏")
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(
+            [a["status"] for a in result["attempted"]],
+            ["timeout", "success"],
+        )
+        # availability 已消耗约 120ms，search 只应拿到剩余约 180ms，
+        # 而不是重新获得完整的 300ms。阈值留足调度余量。
+        self.assertIsNotNone(first.search_timeout_s)
+        self.assertLess(first.search_timeout_s, 0.26)
+        self.assertLess(elapsed, 0.7)
+        await svc.close()
+
+    async def test_availability_cancel_propagates(self):
+        backend = TwoPhaseBackend("web", availability_delay=10)
+        svc = fake_service({"web": backend}, mode="web", timeout_ms=5000)
+        task = asyncio.create_task(svc.search_game_info("游戏"))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertTrue(backend.availability_cancelled)
+        await svc.close()
+
     async def test_timeout_reported(self):
         slow = FakeBackend("web", results=[item()], delay=1.0)
         svc = fake_service({"web": slow}, mode="web", timeout_ms=100)
@@ -364,7 +443,9 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         elapsed = time.monotonic() - start
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["skipped"][0]["reason"], "budget_exhausted")
+        self.assertEqual(
+            result["skipped"][0]["reason"], "backend_budget_exhausted"
+        )
         self.assertLess(elapsed, 0.5)
         await svc.close()
 
@@ -395,7 +476,7 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["effective_backend"], "web")
         self.assertEqual(result["skipped"][0]["backend"], "api")
         self.assertEqual(
-            result["skipped"][0]["reason"], "budget_exhausted"
+            result["skipped"][0]["reason"], "backend_budget_exhausted"
         )
         self.assertLess(elapsed, 0.5)
         await svc.close()
@@ -485,15 +566,19 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
             calls["n"] += 1
             return httpx.Response(200, json={"results": []})
 
-        backend = self._backend(
-            handler, base_url="http://example.com"
-        )
-        available, reason = await backend.availability()
-        self.assertFalse(available)
-        self.assertEqual(reason, "insecure_api_base_url")
-        result = await backend.search("游戏", 3, timeout_s=2)
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.reason, "insecure_api_base_url")
+        for base_url in (
+            "http://example.com",
+            "http://localhost:8765",
+            "http://192.168.1.10:8765",
+        ):
+            with self.subTest(base_url=base_url):
+                backend = self._backend(handler, base_url=base_url)
+                available, reason = await backend.availability()
+                self.assertFalse(available)
+                self.assertEqual(reason, "insecure_api_base_url")
+                result = await backend.search("游戏", 3, timeout_s=2)
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.reason, "insecure_api_base_url")
         self.assertEqual(calls["n"], 0)
 
     async def test_loopback_http_api_key_allowed_for_local_mock(self):
@@ -517,6 +602,40 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
         result = await backend.search("游戏", 3, timeout_s=2)
         self.assertEqual(result.status, "success")
         self.assertEqual(captured["host"], "127.0.0.1")
+
+    async def test_loopback_http_client_ignores_proxy_env(self):
+        proxy_env = {
+            "HTTP_PROXY": "http://203.0.113.10:8080",
+            "HTTPS_PROXY": "http://203.0.113.10:8080",
+            "ALL_PROXY": "http://203.0.113.10:8080",
+        }
+        with patch.dict(os.environ, proxy_env, clear=False):
+            backend = TavilySearchBackend(
+                api_key="tvly-FAKE",
+                base_url="http://127.0.0.1:8765",
+            )
+            client = await backend._get_client()
+            try:
+                self.assertFalse(getattr(client, "_trust_env", True))
+            finally:
+                await backend.close()
+
+    async def test_https_client_keeps_proxy_support(self):
+        proxy_env = {
+            "HTTP_PROXY": "http://203.0.113.10:8080",
+            "HTTPS_PROXY": "http://203.0.113.10:8080",
+            "ALL_PROXY": "http://203.0.113.10:8080",
+        }
+        with patch.dict(os.environ, proxy_env, clear=False):
+            backend = TavilySearchBackend(
+                api_key="tvly-FAKE",
+                base_url="https://api.tavily.com",
+            )
+            client = await backend._get_client()
+            try:
+                self.assertTrue(getattr(client, "_trust_env", False))
+            finally:
+                await backend.close()
 
     async def test_http_error_does_not_leak_key(self):
         fake_key = "tvly-FAKESECRET"
@@ -598,6 +717,28 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<p>Main Snippet after nested list</p></li>'
         '</ol></body></html>'
     )
+    BING_MULTI = (
+        '<html><body><ol>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/one">One Title</a></h2>'
+        '<p>One Snippet</p></li>'
+        '<li>普通列表项，不是搜索结果</li>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/two">Two Title</a></h2>'
+        '<ul><li>Two nested child</li></ul>'
+        '<p>Two Snippet</p></li>'
+        '</ol></body></html>'
+    )
+    BING_NO_SNIPPET = (
+        '<html><body><ol>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/no-snippet">No Snippet</a>'
+        '</h2></li>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/next">Next Title</a></h2>'
+        '<p>Next Snippet</p></li>'
+        '</ol></body></html>'
+    )
 
     def _service(self, handler, mode="web"):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -610,6 +751,11 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(svc.close)
         return svc
+
+    def _backend(self, handler):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.aclose)
+        return WebSearchBackend(client=client)
 
     async def test_valid_web_results(self):
         paths = []
@@ -729,6 +875,39 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["results"][0]["title"], "验证码攻略")
         self.assertNotEqual(result["failure_reason"], "verification_page")
 
+    async def test_bing_multiple_results_keep_own_title_url_snippet(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_MULTI)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        first, second = result["results"]
+        self.assertEqual(first["title"], "One Title")
+        self.assertEqual(first["url"], "https://example.com/one")
+        self.assertEqual(first["snippet"], "One Snippet")
+        self.assertEqual(second["title"], "Two Title")
+        self.assertEqual(second["url"], "https://example.com/two")
+        self.assertEqual(second["snippet"], "Two Snippet")
+        self.assertNotIn("普通列表项", first["snippet"])
+        self.assertNotIn("普通列表项", second["snippet"])
+
+    async def test_bing_missing_snippet_does_not_take_neighbor_text(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_NO_SNIPPET)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertEqual(result["results"][1]["snippet"], "Next Snippet")
+
     async def test_bing_nested_list_keeps_snippet_after_nested_li(self):
         async def handler(request):
             if request.url.host == "www.bing.com":
@@ -742,6 +921,133 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "Main Snippet after nested list",
             result["results"][0]["snippet"],
+        )
+
+    async def test_bing_success_baidu_slow_is_partial(self):
+        cancelled = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append("baidu")
+                raise
+            return httpx.Response(200, text=self.BAIDU_OK)
+
+        backend = self._backend(handler)
+        start = time.monotonic()
+        result = await backend.search("游戏", 3, timeout_s=0.2)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result.status, "success")
+        self.assertTrue(result.partial)
+        self.assertEqual(result.failures, [{
+            "source": "baidu",
+            "status": "timeout",
+            "reason": "timeout",
+        }])
+        self.assertEqual(len(result.results), 1)
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("baidu", cancelled)
+
+    async def test_baidu_success_bing_slow_is_partial(self):
+        cancelled = []
+
+        async def handler(request):
+            if request.url.host == "www.baidu.com":
+                return httpx.Response(200, text=self.BAIDU_OK)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append("bing")
+                raise
+            return httpx.Response(200, text=self.BING_OK)
+
+        backend = self._backend(handler)
+        start = time.monotonic()
+        result = await backend.search("游戏", 3, timeout_s=0.2)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result.status, "success")
+        self.assertTrue(result.partial)
+        self.assertEqual(result.failures[0]["source"], "bing")
+        self.assertEqual(result.failures[0]["reason"], "timeout")
+        self.assertEqual(len(result.results), 1)
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("bing", cancelled)
+
+    async def test_one_source_429_is_partial(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._backend(handler).search(
+            "游戏", 3, timeout_s=0.5
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertTrue(result.partial)
+        self.assertEqual(result.failures, [{
+            "source": "baidu",
+            "status": "failed",
+            "reason": "http_429",
+        }])
+
+    async def test_both_sources_timeout(self):
+        cancelled = []
+
+        async def handler(request):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append(request.url.host)
+                raise
+            return httpx.Response(200)
+
+        backend = self._backend(handler)
+        start = time.monotonic()
+        result = await backend.search("游戏", 3, timeout_s=0.2)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "timeout")
+        self.assertEqual(len(result.failures), 2)
+        self.assertEqual(
+            {item["reason"] for item in result.failures}, {"timeout"}
+        )
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(
+            set(cancelled), {"www.bing.com", "www.baidu.com"}
+        )
+
+    async def test_external_cancel_cleans_all_sources(self):
+        started = {
+            "www.bing.com": asyncio.Event(),
+            "www.baidu.com": asyncio.Event(),
+        }
+        cancelled = []
+
+        async def handler(request):
+            started[request.url.host].set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append(request.url.host)
+                raise
+            return httpx.Response(200)
+
+        backend = self._backend(handler)
+        task = asyncio.create_task(backend.search("游戏", 3, timeout_s=5))
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(
+            set(cancelled), {"www.bing.com", "www.baidu.com"}
         )
 
     async def test_web_backend_direct(self):
@@ -792,15 +1098,86 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("后面的有效摘要", text)
         self.assertNotIn("长" * 1000, text)
 
-    def test_long_url_is_rejected_without_crowding_output(self):
+    def test_long_url_is_omitted_but_title_is_kept(self):
+        long_url = "https://example.com/" + "a" * 4000
         text = build_search_summary([
-            item(title="Long", url="https://example.com/" + "a" * 4000),
+            item(title="Long", url=long_url),
             item(title="OK", url="https://example.com/ok"),
         ], max_total_chars=400)
 
-        self.assertNotIn("Long", text)
+        self.assertIn("Long", text)
         self.assertIn("OK", text)
+        self.assertNotIn(long_url, text)
+        self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_total_budget_200_three_long_results_keep_headers(self):
+        results = [
+            item(
+                title=f"Title-{index}-" + "T" * 300,
+                url=f"https://example.com/{index}/" + "u" * 1000,
+                snippet="S" * 3000,
+                source=f"s{index}",
+            )
+            for index in range(3)
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        for index in range(3):
+            self.assertIn(f"Title-{index}", text)
+            self.assertIn(f"[s{index}]", text)
+        self.assertNotIn("https://", text)
+
+    def test_default_budget_keeps_multiple_results_and_respects_total(self):
+        results = [
+            item(
+                title=f"Default-{index}-" + "T" * 300,
+                url=f"https://example.com/{index}",
+                snippet="S" * 3000,
+                source=f"s{index}",
+            )
+            for index in range(4)
+        ]
+        text = build_search_summary(results, max_total_chars=6000)
+
+        self.assertLessEqual(len(text), 6000)
+        for index in range(4):
+            self.assertIn(f"Default-{index}", text)
+            self.assertIn(f"[s{index}]", text)
+
+    def test_empty_fields_are_not_fabricated(self):
+        text = build_search_summary([{
+            "title": "Only Title",
+            "url": "",
+            "snippet": "",
+            "source": "",
+        }], max_total_chars=200)
+
+        self.assertEqual(text, "Only Title")
+
+    def test_tiny_budget_is_deterministic_and_bounded(self):
+        results = [
+            item(title="First", source="s0"),
+            item(title="Second", source="s1"),
+            item(title="Third", source="s2"),
+        ]
+        text = build_search_summary(results, max_total_chars=3)
+
+        self.assertLessEqual(len(text), 3)
+        self.assertEqual(text, "Fir")
+
+    def test_extremely_long_title_and_url_are_bounded(self):
+        text = build_search_summary([{
+            "title": "Title-" + "T" * 2000,
+            "url": "https://example.com/" + "u" * 5000,
+            "snippet": "S" * 5000,
+            "source": "tavily",
+        }], max_total_chars=300)
+
+        self.assertLessEqual(len(text), 300)
+        self.assertTrue(text.startswith("[tavily] Title-"))
+        self.assertNotIn("https://example.com/", text)
 
     async def test_search_service_summary_input_budget(self):
         backend = FakeBackend("web", results=[

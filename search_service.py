@@ -146,8 +146,6 @@ def _is_loopback_host(host: str | None) -> bool:
     if not host:
         return False
     host = host.strip().lower()
-    if host == "localhost":
-        return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
@@ -189,8 +187,14 @@ def build_search_summary(
 ) -> str:
     """把统一结果拼成供 AI 汇总/生成参考的文本。
 
-    单条标题/摘要先截断，再按条目数均分总量预算，避免第一条超长结果
-    挤掉后续有效条目；最后再执行总预算硬截断。
+    预算规则（确定、可测试）：
+    1. 先为每条结果保留可识别的标题和来源，所有条目均分标题预算；
+    2. 剩余预算优先均分给摘要；
+    3. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
+    4. 最终长度严格不超过总预算。
+
+    总预算小到连分隔符/每条一个字符都放不下时，只保留第一条标题，
+    不编造其他字段。
     """
     items = []
     for item in results:
@@ -199,7 +203,7 @@ def build_search_summary(
             continue
         url = str(item.get("url") or "").strip()
         if len(url) > MAX_URL_CHARS or not _is_http_url(url):
-            continue
+            url = ""  # URL 可省略，但不能截断成看似完整的错误 URL
         snippet = _truncate_text(
             str(item.get("snippet") or ""), MAX_SNIPPET_CHARS
         )
@@ -209,16 +213,62 @@ def build_search_summary(
     if not items:
         return ""
 
-    per_item_budget = max(200, int(max_total_chars) // len(items))
-    blocks = []
-    for source, title, snippet, url in items:
-        block = f"[{source}] {title}" if source else title
-        if snippet:
-            block += f"\n{snippet}"
-        if url:
-            block += f"\n{url}"
-        blocks.append(_truncate_text(block, per_item_budget))
-    return _truncate_text("\n\n".join(blocks), max_total_chars)
+    try:
+        total = int(max_total_chars)
+    except (TypeError, ValueError):
+        total = DEFAULT_SUMMARY_INPUT_MAX_CHARS
+    total = max(1, total)
+
+    count = len(items)
+    separators = 2 * (count - 1)
+    if total <= separators:
+        return _truncate_text(items[0][1], total)
+
+    available = total - separators
+    if available < count:
+        return _truncate_text(items[0][1], total)
+
+    # 每条结果至少分到标题/来源预算；短标题节省下来的空间留给摘要。
+    header_share = max(1, available // count)
+    headers = []
+    for source, title, _snippet, _url in items:
+        header = f"[{source}] {title}" if source else title
+        headers.append(_truncate_text(header, header_share))
+
+    blocks = list(headers)
+    used = sum(len(block) for block in blocks)
+    remaining = max(0, available - used)
+
+    # 摘要优先于 URL；为每条摘要的换行符预留空间后均分。
+    snippet_indices = [
+        index for index, item in enumerate(items) if item[2]
+    ]
+    if snippet_indices and remaining > len(snippet_indices):
+        text_budget = remaining - len(snippet_indices)
+        per_snippet = text_budget // len(snippet_indices)
+        extra = text_budget - per_snippet * len(snippet_indices)
+        for index in snippet_indices:
+            allowance = per_snippet + (1 if extra > 0 else 0)
+            if extra > 0:
+                extra -= 1
+            if allowance <= 0:
+                continue
+            snippet = _truncate_text(items[index][2], allowance)
+            if not snippet:
+                continue
+            blocks[index] += f"\n{snippet}"
+            used += 1 + len(snippet)
+
+    # URL 只在完整放得下时追加，避免截断 URL 造成错误链接。
+    for index, (_source, _title, _snippet, url) in enumerate(items):
+        if not url:
+            continue
+        addition = 1 + len(url)
+        if used + addition <= available:
+            blocks[index] += f"\n{url}"
+            used += addition
+
+    return "\n\n".join(blocks)
 
 
 def prepare_search_digest(
@@ -482,10 +532,17 @@ class TavilySearchBackend(SearchBackend):
         """携带 Key 时默认必须 HTTPS；仅允许回环 HTTP 供本地模拟。"""
         parsed = urlparse(self._base_url)
         if parsed.scheme == "https":
-            return bool(parsed.netloc)
+            return bool(parsed.hostname)
         if parsed.scheme == "http":
             return _is_loopback_host(parsed.hostname)
         return False
+
+    def _is_loopback_http(self) -> bool:
+        parsed = urlparse(self._base_url)
+        return (
+            parsed.scheme == "http"
+            and _is_loopback_host(parsed.hostname)
+        )
 
     async def availability(self, event=None) -> tuple[bool, str]:
         if self._provider != "tavily":
@@ -500,7 +557,15 @@ class TavilySearchBackend(SearchBackend):
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=None)
+            if self._is_loopback_http():
+                # 回环 HTTP 只用于本机测试；禁用 trust_env，确保
+                # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 不会把明文 Bearer
+                # Key 转发给远端代理。HTTPS 正式服务仍保留系统代理。
+                self._client = httpx.AsyncClient(
+                    timeout=None, trust_env=False
+                )
+            else:
+                self._client = httpx.AsyncClient(timeout=None)
         return self._client
 
     def _failure(self, status: str, reason: str, start: float) -> BackendResult:
@@ -590,6 +655,103 @@ class TavilySearchBackend(SearchBackend):
             await self._client.aclose()
 
 
+class _BingBlockParser(HTMLParser):
+    """按标签深度提取完整的 b_algo 结果容器，支持嵌套 ul/li。"""
+
+    def __init__(self, container_tag: str):
+        super().__init__(convert_charrefs=True)
+        self.container_tag = container_tag
+        self.depth = 0
+        self.capture_depth: int | None = None
+        self.buffer: list[str] = []
+        self.blocks: list[str] = []
+
+    @staticmethod
+    def _is_result_start(attrs) -> bool:
+        classes = dict(attrs).get("class") or ""
+        return "b_algo" in classes.split()
+
+    def handle_starttag(self, tag, attrs):
+        raw = self.get_starttag_text() or f"<{tag}>"
+        if tag == self.container_tag:
+            self.depth += 1
+            if self.capture_depth is None and self._is_result_start(attrs):
+                self.capture_depth = self.depth
+                self.buffer = []
+            if self.capture_depth is not None:
+                self.buffer.append(raw)
+            return
+        if self.capture_depth is not None:
+            self.buffer.append(raw)
+
+    def handle_startendtag(self, tag, attrs):
+        raw = self.get_starttag_text() or f"<{tag}/>"
+        if self.capture_depth is not None:
+            self.buffer.append(raw)
+
+    def handle_endtag(self, tag):
+        if tag == self.container_tag:
+            if self.capture_depth is not None:
+                self.buffer.append(f"</{tag}>")
+            if (
+                self.capture_depth is not None
+                and self.depth == self.capture_depth
+            ):
+                self.blocks.append("".join(self.buffer))
+                self.capture_depth = None
+                self.buffer = []
+            self.depth = max(0, self.depth - 1)
+            return
+        if self.capture_depth is not None:
+            self.buffer.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self.capture_depth is not None:
+            self.buffer.append(data)
+
+    def handle_entityref(self, name):
+        if self.capture_depth is not None:
+            self.buffer.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self.capture_depth is not None:
+            self.buffer.append(f"&#{name};")
+
+
+class _BingSnippetParser(HTMLParser):
+    """只收集结果容器顶层的 <p>，跳过嵌套列表/普通 li 内文字。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.list_depth = 0
+        self.parts: list[str] = []
+        self.in_paragraph = False
+        self.snippet = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("ul", "ol"):
+            self.list_depth += 1
+            return
+        if tag == "p" and self.list_depth == 0 and not self.in_paragraph:
+            self.in_paragraph = True
+            self.parts = []
+
+    def handle_endtag(self, tag):
+        if tag in ("ul", "ol"):
+            self.list_depth = max(0, self.list_depth - 1)
+            return
+        if tag == "p" and self.in_paragraph:
+            text = _strip_html("".join(self.parts))
+            if text and not self.snippet:
+                self.snippet = text
+            self.in_paragraph = False
+            self.parts = []
+
+    def handle_data(self, data):
+        if self.in_paragraph:
+            self.parts.append(data)
+
+
 class WebSearchBackend(SearchBackend):
     """Bing + 百度搜索页尽力而为后端；不抓取结果链接正文。"""
 
@@ -622,6 +784,14 @@ class WebSearchBackend(SearchBackend):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
+
+    @staticmethod
+    async def _cancel_tasks(tasks) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @classmethod
     def _is_verification_page(cls, html: str) -> bool:
@@ -660,20 +830,45 @@ class WebSearchBackend(SearchBackend):
             source_timeout = min(
                 source_timeout, max(0.01, source_timeout * 0.9)
             )
-        tasks = [
-            asyncio.create_task(
+        labeled_tasks = [
+            ("bing", asyncio.create_task(
                 self._search_bing(client, query, max_results, source_timeout)
-            ),
-            asyncio.create_task(
+            )),
+            ("baidu", asyncio.create_task(
                 self._search_baidu(client, query, max_results, source_timeout)
-            ),
+            )),
         ]
+        labels = {task: label for label, task in labeled_tasks}
+        tasks = list(labels)
         try:
-            source_results = await asyncio.gather(*tasks)
+            done, pending = await asyncio.wait(tasks, timeout=source_timeout)
         except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
+            await self._cancel_tasks(tasks)
             raise
+
+        if pending:
+            for task in pending:
+                task.cancel()
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError:
+                await self._cancel_tasks(tasks)
+                raise
+
+        source_results = []
+        for task in tasks:
+            label = labels[task]
+            if task in pending:
+                source_results.append((label, "timeout", [], "timeout"))
+                continue
+            if task.cancelled():
+                source_results.append((label, "failed", [], "backend_error"))
+                continue
+            exc = task.exception()
+            if exc is not None:
+                source_results.append((label, "failed", [], "backend_error"))
+                continue
+            source_results.append(task.result())
 
         merged: list[dict] = []
         seen: set[str] = set()
@@ -806,24 +1001,34 @@ class WebSearchBackend(SearchBackend):
         return "http_error"
 
     @staticmethod
+    def _bing_blocks(html: str) -> list[str]:
+        for container_tag in ("li", "div"):
+            parser = _BingBlockParser(container_tag)
+            try:
+                parser.feed(html)
+                parser.close()
+            except Exception:
+                return parser.blocks
+            if parser.blocks:
+                return parser.blocks
+        return []
+
+    @staticmethod
+    def _bing_snippet(block: str) -> str:
+        parser = _BingSnippetParser()
+        try:
+            parser.feed(block)
+            parser.close()
+        except Exception:
+            return ""
+        return parser.snippet
+
+    @staticmethod
     def _parse_bing(html: str) -> list[dict]:
-        # b_algo 内部可能嵌套 <ul><li>，不能用非贪婪 </li> 截断结果块。
-        # 捕获到下一个 b_algo / </ol> / 页面结束为止。
-        blocks = re.findall(
-            r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)'
-            r'(?=<li[^>]*class="[^"]*b_algo|</ol>|</body>|$)',
-            html,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not blocks:
-            blocks = re.findall(
-                r'<div[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)'
-                r'(?=<div[^>]*class="[^"]*b_algo|</body>|$)',
-                html,
-                re.DOTALL | re.IGNORECASE,
-            )
+        # 只解析完整的 b_algo 容器；普通列表、广告和相邻结果不会进入
+        # 当前结果的摘要范围。容器内部嵌套 ul/li 由深度跟踪保留。
         items = []
-        for block in blocks:
+        for block in WebSearchBackend._bing_blocks(html):
             anchor = re.search(
                 r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
                 block,
@@ -833,15 +1038,7 @@ class WebSearchBackend(SearchBackend):
                 continue
             url = urljoin("https://www.bing.com", html_lib.unescape(anchor.group(1)))
             title = _strip_html(anchor.group(2))
-            # 摘要通常位于嵌套列表之后，取块内最后一个非空 <p>。
-            paragraphs = [
-                _strip_html(item)
-                for item in re.findall(
-                    r'<p[^>]*>(.*?)</p>', block, re.DOTALL | re.IGNORECASE
-                )
-            ]
-            paragraphs = [item for item in paragraphs if item]
-            snippet = paragraphs[-1] if paragraphs else ""
+            snippet = WebSearchBackend._bing_snippet(block)
             item = _normalize_item(
                 {"title": title, "url": url, "snippet": snippet, "source": "bing"}
             )
@@ -1031,15 +1228,23 @@ class SearchService:
                 skip(name, "unavailable", "backend_unavailable")
                 continue
 
+            backend_deadline = min(
+                deadline, loop.time() + attempt_budget
+            )
             try:
+                availability_timeout = backend_deadline - loop.time()
+                if availability_timeout <= 0:
+                    skip(name, "timeout", "backend_budget_exhausted")
+                    continue
                 available, reason = await asyncio.wait_for(
-                    backend.availability(event), timeout=attempt_budget
+                    backend.availability(event),
+                    timeout=availability_timeout,
                 )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
                 # 只消耗该后端的分配额度，让后续候选继续使用剩余预算。
-                skip(name, "timeout", "budget_exhausted")
+                skip(name, "timeout", "backend_budget_exhausted")
                 continue
             except Exception:
                 available, reason = False, "backend_unavailable"
@@ -1047,13 +1252,12 @@ class SearchService:
                 skip(name, "unavailable", reason or "backend_unavailable")
                 continue
 
-            remaining = deadline - loop.time()
-            attempt_budget = self._attempt_timeout(
-                remaining, len(order) - index
-            )
-            if attempt_budget <= 0:
-                skip(name, "timeout", "budget_exhausted")
-                break
+            search_timeout = backend_deadline - loop.time()
+            if search_timeout <= 0:
+                skip(name, "timeout", "backend_budget_exhausted")
+                if deadline <= loop.time():
+                    break
+                continue
 
             attempt_start = loop.time()
             try:
@@ -1062,9 +1266,9 @@ class SearchService:
                         query,
                         self.result_count,
                         event=event,
-                        timeout_s=attempt_budget,
+                        timeout_s=search_timeout,
                     ),
-                    timeout=attempt_budget,
+                    timeout=search_timeout,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1192,6 +1396,7 @@ _REASON_TEXT = {
     "no_results": "无有效结果",
     "timeout": "超时",
     "budget_exhausted": "总时间预算耗尽",
+    "backend_budget_exhausted": "单后端时间预算耗尽",
     "http_401": "API Key 无效",
     "http_403": "API 访问被拒绝",
     "http_429": "API 限流",
