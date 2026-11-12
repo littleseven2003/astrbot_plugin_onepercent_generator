@@ -762,6 +762,12 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<p>Two Snippet</p></li>'
         '</ol></body></html>'
     )
+    BING_MULTI_ANCHOR = (
+        '<html><body><ol><li class="b_algo"><h2>'
+        '<a href="https://example.com/good">Actual Title</a>'
+        '<a href="https://example.com/other">More</a>'
+        '</h2><p>Summary</p></li></ol></body></html>'
+    )
     BING_ENTITIES = (
         '<html><body><ol>'
         '<li class="b_algo"><h2>'
@@ -941,6 +947,22 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("普通列表项", first["snippet"])
         self.assertNotIn("普通列表项", second["snippet"])
 
+    async def test_bing_secondary_title_link_does_not_override(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_MULTI_ANCHOR)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["results"][0]["title"], "Actual Title")
+        self.assertEqual(
+            result["results"][0]["url"], "https://example.com/good"
+        )
+        self.assertEqual(result["results"][0]["snippet"], "Summary")
+
     async def test_bing_entities_are_decoded_once_and_not_stripped(self):
         async def handler(request):
             if request.url.host == "www.bing.com":
@@ -1018,6 +1040,137 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["cleanup_incomplete"])
         self.assertTrue(cleanup_done)
         self.assertLess(elapsed, 0.15)
+
+    async def test_cleanup_beyond_sync_budget_finishes_on_close(self):
+        cleanup_done = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0.2)
+                cleanup_done.append("baidu")
+
+        svc = self._service(handler, timeout_ms=100)
+        result = await svc.search_game_info("游戏")
+        web = svc._backends["web"]
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["cleanup_incomplete"])
+        self.assertFalse(cleanup_done)
+        self.assertGreaterEqual(web.pending_cleanup_count, 1)
+
+        await svc.close()
+
+        self.assertTrue(cleanup_done)
+        self.assertEqual(web.pending_cleanup_count, 0)
+        self.assertFalse(web.close_incomplete)
+        self.assertTrue(web._client.is_closed)
+
+    async def test_cleanup_ignoring_cancel_does_not_block_result(self):
+        cancel_count = []
+        cleanup_done = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancel_count.append(1)
+                await asyncio.sleep(0.45)
+                cleanup_done.append(1)
+
+        svc = self._service(handler, timeout_ms=100)
+        start = time.monotonic()
+        result = await svc.search_game_info("游戏")
+        elapsed = time.monotonic() - start
+        web = svc._backends["web"]
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["cleanup_incomplete"])
+        self.assertFalse(cleanup_done)
+        self.assertEqual(cancel_count, [1])
+        self.assertLess(elapsed, 0.2)
+        self.assertGreaterEqual(web.pending_cleanup_count, 1)
+
+        await svc.close()
+
+        self.assertTrue(cleanup_done)
+        self.assertEqual(cancel_count, [1])
+        self.assertEqual(web.pending_cleanup_count, 0)
+        self.assertFalse(web.close_incomplete)
+
+    async def test_cleanup_catches_second_cancel_in_close(self):
+        second_cancel = []
+        cleanup_done = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.sleep(0.45)
+                except asyncio.CancelledError:
+                    second_cancel.append(1)
+                    await asyncio.sleep(0.05)
+                cleanup_done.append(1)
+
+        svc = self._service(handler, timeout_ms=100)
+        result = await svc.search_game_info("游戏")
+        web = svc._backends["web"]
+        self.assertTrue(result["cleanup_incomplete"])
+        web.CLOSE_CLEANUP_TIMEOUT = 0.05
+        web.CLOSE_CANCEL_GRACE = 0.3
+
+        await svc.close()
+
+        self.assertTrue(second_cancel)
+        self.assertTrue(cleanup_done)
+        self.assertEqual(web.pending_cleanup_count, 0)
+        self.assertFalse(web.close_incomplete)
+
+    async def test_close_reports_unkillable_cleanup_and_recovers(self):
+        release = asyncio.Event()
+        cleanup_done = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+                cleanup_done.append(1)
+
+        svc = self._service(handler, timeout_ms=100)
+        result = await svc.search_game_info("游戏")
+        web = svc._backends["web"]
+        self.assertTrue(result["cleanup_incomplete"])
+        web.CLOSE_CLEANUP_TIMEOUT = 0.02
+        web.CLOSE_CANCEL_GRACE = 0.02
+
+        await svc.close()
+
+        self.assertTrue(web.close_incomplete)
+        self.assertGreaterEqual(web.pending_cleanup_count, 1)
+
+        release.set()
+        await asyncio.sleep(0.02)
+        await svc.close()
+
+        self.assertTrue(cleanup_done)
+        self.assertEqual(web.pending_cleanup_count, 0)
+        self.assertFalse(web.close_incomplete)
 
     async def test_bing_success_baidu_slow_is_partial(self):
         cancelled = []
@@ -1142,9 +1295,12 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
+        await backend.close()
         self.assertEqual(
             set(cancelled), {"www.bing.com", "www.baidu.com"}
         )
+        self.assertEqual(backend.pending_cleanup_count, 0)
+        self.assertFalse(backend.close_incomplete)
 
     async def test_web_backend_direct(self):
         async def handler(request):

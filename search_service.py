@@ -690,6 +690,7 @@ class _BingResultParser(HTMLParser):
     def _reset_result(self):
         self.in_title = False
         self.title_seen = False
+        self.title_anchor_seen = False
         self.title_parts: list[str] = []
         self.url = ""
         self.h2_depth = 0
@@ -754,8 +755,14 @@ class _BingResultParser(HTMLParser):
         if tag == "br" and self.in_snippet:
             self.snippet_parts.append(" ")
             return
-        if tag == "a" and self.h2_depth > 0 and not self.in_title:
+        if (
+            tag == "a"
+            and self.h2_depth > 0
+            and not self.in_title
+            and not self.title_anchor_seen
+        ):
             href = dict(attrs).get("href") or ""
+            self.title_anchor_seen = True
             self.in_title = True
             self.title_parts = []
             if href:
@@ -827,9 +834,18 @@ class WebSearchBackend(SearchBackend):
         "access denied",
     )
 
+    CLOSE_CLEANUP_TIMEOUT = 2.0
+    CLOSE_CANCEL_GRACE = 0.2
+
     def __init__(self, client: httpx.AsyncClient | None = None):
         self._client = client
         self._cleanup_tasks: set[asyncio.Task] = set()
+        self.close_incomplete = False
+        self.cleanup_failures = 0
+
+    @property
+    def pending_cleanup_count(self) -> int:
+        return sum(1 for task in self._cleanup_tasks if not task.done())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -844,14 +860,6 @@ class WebSearchBackend(SearchBackend):
         }
 
     @staticmethod
-    async def _cancel_tasks(tasks) -> None:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    @staticmethod
     def _source_deadlines(timeout_s: float | None) -> tuple[
         float | None, float
     ]:
@@ -864,8 +872,8 @@ class WebSearchBackend(SearchBackend):
         """
         if timeout_s is None:
             return None, 0.0
-        cleanup = min(0.06, max(0.005, timeout_s * 0.6))
-        margin = min(0.01, max(0.001, timeout_s * 0.05))
+        cleanup = min(0.06, max(0.01, timeout_s * 0.6))
+        margin = min(0.02, max(0.005, timeout_s * 0.1))
         source = timeout_s - cleanup - margin
         if source < 0.005:
             source = max(0.001, timeout_s * 0.2)
@@ -918,7 +926,16 @@ class WebSearchBackend(SearchBackend):
         try:
             done, pending = await asyncio.wait(tasks, timeout=source_timeout)
         except asyncio.CancelledError:
-            await self._cancel_tasks(tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            self._cleanup_tasks.update(
+                task for task in tasks if not task.done()
+            )
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
             raise
 
         cleanup_incomplete = False
@@ -927,26 +944,32 @@ class WebSearchBackend(SearchBackend):
             for task in pending_list:
                 task.cancel()
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending_list, return_exceptions=True),
-                    timeout=cleanup_budget,
+                # 只取消一次；这里不再用 wait_for，避免超时后自动发起
+                # 第二次取消，静默打断 finally 中的正常资源清理。
+                _, cleanup_pending = await asyncio.wait(
+                    pending_list, timeout=cleanup_budget
                 )
-            except asyncio.TimeoutError:
-                cleanup_incomplete = True
+            except asyncio.CancelledError:
                 self._cleanup_tasks.update(
                     task for task in pending_list if not task.done()
                 )
-                logger.warning(
-                    "[小作文生成器] 网页来源取消清理超时: %s",
-                    ", ".join(labels[task] for task in pending_list),
-                )
-                for task in pending_list:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.sleep(0)
-            except asyncio.CancelledError:
-                await self._cancel_tasks(tasks)
                 raise
+
+            for task in pending_list:
+                if task.done() and not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None:
+                        logger.warning(
+                            "[小作文生成器] 网页来源清理异常: %s",
+                            type(exc).__name__,
+                        )
+            if cleanup_pending:
+                cleanup_incomplete = True
+                self._cleanup_tasks.update(cleanup_pending)
+                logger.warning(
+                    "[小作文生成器] 网页来源清理超出同步预算，已转入关闭阶段: %s",
+                    ", ".join(labels[task] for task in cleanup_pending),
+                )
 
         source_results = []
         for task in tasks:
@@ -1160,11 +1183,79 @@ class WebSearchBackend(SearchBackend):
                 items.append(item)
         return items
 
+    def _consume_cleanup_exceptions(self, tasks) -> None:
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                try:
+                    exc = task.exception()
+                except asyncio.CancelledError:
+                    continue
+                if exc is not None:
+                    self.cleanup_failures += 1
+                    logger.warning(
+                        "[小作文生成器] 网页来源清理任务失败: %s",
+                        type(exc).__name__,
+                    )
+
     async def close(self) -> None:
+        self.close_incomplete = False
         if self._cleanup_tasks:
-            pending = list(self._cleanup_tasks)
-            self._cleanup_tasks.clear()
-            await self._cancel_tasks(pending)
+            pending = {
+                task for task in self._cleanup_tasks if not task.done()
+            }
+            self._consume_cleanup_exceptions(self._cleanup_tasks - pending)
+            self._cleanup_tasks = pending
+            if pending:
+                # 先给正常 finally 清理足够时间，不主动第二次取消。
+                try:
+                    done, pending = await asyncio.wait(
+                        pending, timeout=self.CLOSE_CLEANUP_TIMEOUT
+                    )
+                except asyncio.CancelledError:
+                    for task in pending:
+                        task.cancel()
+                    self._cleanup_tasks = set(pending)
+                    self.close_incomplete = True
+                    raise
+
+                self._consume_cleanup_exceptions(done)
+                self._cleanup_tasks = {
+                    task for task in pending if not task.done()
+                }
+                if self._cleanup_tasks:
+                    logger.warning(
+                        "[小作文生成器] close 等待清理超时，"
+                        "执行最后一次取消: %s",
+                        len(self._cleanup_tasks),
+                    )
+                    for task in self._cleanup_tasks:
+                        task.cancel()
+                    try:
+                        done, pending = await asyncio.wait(
+                            self._cleanup_tasks,
+                            timeout=self.CLOSE_CANCEL_GRACE,
+                        )
+                    except asyncio.CancelledError:
+                        self._cleanup_tasks = {
+                            task
+                            for task in self._cleanup_tasks
+                            if not task.done()
+                        }
+                        self.close_incomplete = True
+                        raise
+
+                    self._consume_cleanup_exceptions(done)
+                    self._cleanup_tasks = {
+                        task for task in pending if not task.done()
+                    }
+                    if self._cleanup_tasks:
+                        self.close_incomplete = True
+                        logger.error(
+                            "[小作文生成器] close 时仍有无法终止的"
+                            "清理任务: %s",
+                            len(self._cleanup_tasks),
+                        )
+
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
 
