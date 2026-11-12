@@ -13,7 +13,11 @@ from .ai_client import AIClient, AIClientError
 from .post_process import build_final_message
 from .prompt import build_main_prompt
 from .rate_limiter import RateLimiter
-from .search_service import SearchService
+from .search_service import (
+    BACKEND_LABELS,
+    SearchService,
+    prepare_search_digest,
+)
 from .whitelist import is_session_allowed
 
 
@@ -45,6 +49,14 @@ class OnePercentGenerator(Star):
             enabled=search_cfg.get("enabled", True),
             timeout_ms=search_cfg.get("timeout_ms", 8000),
             result_count=search_cfg.get("result_count", 3),
+            mode=search_cfg.get("mode"),
+            fallback_enabled=search_cfg.get("fallback_enabled", False),
+            api_key=search_cfg.get("api_key", ""),
+            api_base_url=search_cfg.get(
+                "api_base_url", "https://api.tavily.com"
+            ),
+            api_provider=search_cfg.get("api_provider", "tavily"),
+            astrbot_context=self.context,
         )
         self.search_summarize_enabled = search_cfg.get("summarize_enabled", True)
         self.search_summarize_max_chars = search_cfg.get("summarize_max_chars", 150)
@@ -162,29 +174,44 @@ class OnePercentGenerator(Star):
         else:
             yield event.plain_result(f"正在为《{game_name}》生成小作文...")
 
-        # 联网搜索
-        search_result = await self.search_service.search_game_info(game_name)
+        # 联网搜索（多后端，统一总预算）
+        search_result = await self.search_service.search_game_info(
+            game_name, event=event
+        )
         raw_summary = search_result.get("summary", "")
-        logger.info(f"[小作文生成器] 搜索状态: {search_result['status']}, 游戏: {game_name}")
+        logger.info(
+            "[小作文生成器] 搜索状态: %s, 后端: %s, 有效结果: %s, 游戏: %s",
+            search_result.get("status"),
+            search_result.get("effective_backend") or "none",
+            len(search_result.get("results", [])),
+            game_name,
+        )
 
-        # AI 汇总搜索结果
-        search_digest = ""
+        # AI 汇总搜索结果；失败/关闭时回退原始摘要，并统一执行字数预算
+        ai_digest = ""
         if raw_summary and self.search_summarize_enabled:
             try:
                 digest_result = await self.ai_client.summarize_search(
                     game_name, raw_summary, self.search_summarize_max_chars
                 )
-                search_digest = digest_result["content"]
-                logger.info(f"[小作文生成器] 搜索汇总完成: {len(search_digest)} 字符")
+                ai_digest = digest_result["content"]
+                logger.info(
+                    "[小作文生成器] 搜索汇总完成: %s 字符",
+                    len(ai_digest),
+                )
             except AIClientError as e:
-                logger.warning(f"[小作文生成器] 搜索汇总失败，使用原始摘要: {e}")
-                search_digest = raw_summary[:self.search_summarize_max_chars]
-        elif raw_summary:
-            # 未启用搜索汇总，直接使用原始搜索结果
-            search_digest = raw_summary[:self.search_summarize_max_chars]
+                logger.warning(
+                    "[小作文生成器] 搜索汇总失败，使用原始摘要: %s",
+                    e,
+                )
+        search_digest = prepare_search_digest(
+            raw_summary,
+            ai_digest,
+            self.search_summarize_max_chars,
+        )
 
-        # 组装 Prompt（使用搜索汇总作为参考）
-        prompt = build_main_prompt(game_name, search_digest or raw_summary)
+        # 组装 Prompt（使用已受字数预算约束的搜索汇总）
+        prompt = build_main_prompt(game_name, search_digest)
 
         # 调用 AI 生成小作文
         try:
@@ -208,6 +235,13 @@ class OnePercentGenerator(Star):
             tokens = ai_result["token_usage"]
             search_provider = search_result.get("provider", "未使用")
             search_duration = f"{search_result.get('duration_ms', 0) / 1000:.1f}秒"
+            search_backend = search_result.get("effective_backend", "")
+            search_backend_label = BACKEND_LABELS.get(
+                search_backend, search_backend or "无"
+            )
+            search_degraded = "是" if search_result.get("degraded") else "否"
+            search_valid_count = len(search_result.get("results", []))
+            search_failure_reason = search_result.get("failure_reason", "")
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)
@@ -225,7 +259,15 @@ class OnePercentGenerator(Star):
                 f"生成时间：{duration_s}",
                 f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
                 f"搜索服务：{search_provider}（{search_duration}）",
+                f"搜索后端：{search_backend_label}",
+                f"搜索降级：{search_degraded}",
+                f"有效结果：{search_valid_count}",
                 f"搜索汇总：{search_digest if search_digest else '无'}",
+                *(
+                    [f"搜索失败原因：{search_failure_reason}"]
+                    if search_result.get("status") == "failed"
+                    else []
+                ),
                 f"用户限制：{usage_str}",
             ]
             yield event.plain_result("\n".join(info_lines))
@@ -265,15 +307,15 @@ class OnePercentGenerator(Star):
             return
 
         yield event.plain_result(f"正在测试联网搜索（游戏：{game_name}）...")
-        result = await self.search_service.test_search(game_name)
+        result = await self.search_service.test_search(game_name, event=event)
 
-        if result["success"]:
-            summary_preview = result["summary"][:300] + ("..." if len(result["summary"]) > 300 else "")
-            yield event.plain_result(
-                f"✅ {result['message']}\n\n搜索结果摘要：\n{summary_preview}"
-            )
-        else:
-            yield event.plain_result(f"❌ {result['message']}")
+        prefix = "✅" if result["success"] else "❌"
+        lines = [f"{prefix} {result['message']}"]
+        if result["summary"]:
+            summary = result["summary"]
+            preview = summary[:300] + ("..." if len(summary) > 300 else "")
+            lines.append(f"\n搜索结果摘要：\n{preview}")
+        yield event.plain_result("\n".join(lines))
         event.stop_event()
 
     # ========================================================================
