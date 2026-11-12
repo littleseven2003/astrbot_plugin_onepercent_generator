@@ -933,6 +933,8 @@ class _BaiduResultFrame:
         self.title_parts: list[str] = []
         self.url = ""
         self.h3_depth = 0
+        self.h3_seen = False
+        self.titled_children: list[dict] = []
         self.in_snippet = False
         self.snippet_tag: str | None = None
         self.snippet_tag_depth = 0
@@ -988,15 +990,38 @@ class _BaiduResultParser(HTMLParser):
         self._finish_snippet(frame)
         title = "".join(frame.title_parts).strip()
         if title:
-            self.results.append({
+            entry = {
                 "title": title,
                 "url": frame.url,
                 "snippet": frame.snippet,
-            })
+            }
+            self.results.append(entry)
+            if parent is not None:
+                parent.titled_children.append(entry)
             return
-        # 无标题的内层容器是布局/摘要包装：把摘要上推给最近的有标题
-        # 祖先；已有直接摘要时优先保留祖先自己的摘要。
-        if frame.snippet and parent is not None and not parent.snippet:
+
+        # 出现过 h3 却没有有效标题：这是一个“标题不可用的独立结果”，
+        # 它的摘要不能上推给父结果，否则会把 B 的事实算到 A 头上。
+        if frame.h3_seen:
+            return
+
+        if frame.titled_children:
+            # 父容器自身无标题，但只有一个有标题子结果，且摘要在父容器
+            # 兄弟节点：唯一归属明确，补给该子结果。多个子结果时不猜。
+            if (
+                len(frame.titled_children) == 1
+                and frame.snippet
+                and not frame.titled_children[0]["snippet"]
+            ):
+                frame.titled_children[0]["snippet"] = frame.snippet
+            return
+
+        if parent is None:
+            return
+
+        # 纯布局/摘要包装：摘要上推给最近的无标题祖先，随后由有标题
+        # 祖先消费；不拼接多个包装的摘要。
+        if frame.snippet and not parent.snippet:
             parent.snippet = frame.snippet
 
     def handle_starttag(self, tag, attrs):
@@ -1005,12 +1030,12 @@ class _BaiduResultParser(HTMLParser):
             self.div_depth += 1
             if self._is_candidate(attrs):
                 self.stack.append(_BaiduResultFrame(self.div_depth))
-                return
 
         if not self.stack:
             return
         frame = self.stack[-1]
         if tag == "h3":
+            frame.h3_seen = True
             frame.h3_depth += 1
             return
         if (

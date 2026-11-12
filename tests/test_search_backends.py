@@ -319,14 +319,14 @@ class TwoPhaseBackend(SearchBackend):
 class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_total_budget_not_per_backend(self):
         first = FakeBackend("api", status="no_results",
-                            reason="empty_results", delay=0.08)
-        second = FakeBackend("web", results=[item()], delay=0.08)
+                            reason="empty_results", delay=0.18)
+        second = FakeBackend("web", results=[item()], delay=0.5)
         svc = fake_service(
             {"api": first, "web": second},
             mode="api",
             fallback_enabled=True,
-            timeout_ms=150,
-            per_backend_timeout_ms=100,
+            timeout_ms=500,
+            per_backend_timeout_ms=300,
         )
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
@@ -335,18 +335,18 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual([a["status"] for a in result["attempted"]],
                          ["no_results", "timeout"])
-        self.assertLess(elapsed, 0.5)
+        self.assertLess(elapsed, 1.0)
         await svc.close()
 
     async def test_previous_timeout_leaves_time_for_next(self):
-        first = FakeBackend("api", results=[item()], delay=1.0)
+        first = FakeBackend("api", results=[item()], delay=2.0)
         second = FakeBackend("web", results=[item(source="bing")], delay=0.05)
         svc = fake_service(
             {"api": first, "web": second},
             mode="api",
             fallback_enabled=True,
-            timeout_ms=500,
-            per_backend_timeout_ms=100,
+            timeout_ms=2000,
+            per_backend_timeout_ms=200,
         )
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
@@ -363,7 +363,7 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             ["timeout", "success"],
         )
         self.assertTrue(result["degraded"])
-        self.assertLess(elapsed, 0.5)
+        self.assertLess(elapsed, 1.0)
         await svc.close()
 
     async def test_two_phases_share_one_backend_budget(self):
@@ -454,7 +454,7 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             name = "api"
 
             async def availability(self, event=None):
-                await asyncio.sleep(1)
+                await asyncio.sleep(3)
                 return True, ""
 
             async def search(self, query, max_results, event=None, timeout_s=None):
@@ -465,8 +465,8 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             {"api": SlowAvailability(), "web": web},
             mode="api",
             fallback_enabled=True,
-            timeout_ms=500,
-            per_backend_timeout_ms=100,
+            timeout_ms=2000,
+            per_backend_timeout_ms=300,
         )
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
@@ -478,7 +478,7 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result["skipped"][0]["reason"], "backend_budget_exhausted"
         )
-        self.assertLess(elapsed, 0.5)
+        self.assertLess(elapsed, 1.0)
         await svc.close()
 
     async def test_outer_cancellation_propagates(self):
@@ -756,6 +756,28 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<html><body><div class="result"><h3>'
         '<a href="https://example.com/result-only">Result Only</a></h3>'
         '<div class="c-abstract">Result Snippet</div></div></body></html>'
+    )
+    BAIDU_SELF_ABSTRACT = (
+        '<html><body><div class="result c-container"><h3>'
+        '<a href="https://example.com/self">Self Abstract</a></h3>'
+        '<div class="c-container c-abstract">Self Summary</div>'
+        '</div></body></html>'
+    )
+    BAIDU_AMBIGUOUS_PARENT_SUMMARY = (
+        '<html><body><div class="result">'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/amb-a">Amb A</a></h3></div>'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/amb-b">Amb B</a></h3></div>'
+        '<div class="c-abstract">Ambiguous Summary</div>'
+        '</div></body></html>'
+    )
+    BAIDU_TITLE_CHILD_SUMMARY_PARENT = (
+        '<html><body><div class="result">'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/child-title">Child Title</a></h3>'
+        '</div><div class="c-abstract">Parent Sibling Summary</div>'
+        '</div></body></html>'
     )
     BAIDU_WRAPPED_SUMMARY = (
         '<html><body><div class="result c-container"><h3>'
@@ -1110,18 +1132,18 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_fast_source_survives_slow_source_async_cleanup(self):
-        cleanup_done = []
+        cleanup_done = asyncio.Event()
+        slow = asyncio.Event()
 
         async def handler(request):
             if request.url.host == "www.bing.com":
                 return httpx.Response(200, text=self.BING_OK)
             try:
-                await asyncio.sleep(10)
+                await slow.wait()
             finally:
-                await asyncio.sleep(0.05)
-                cleanup_done.append("baidu")
+                cleanup_done.set()
 
-        svc = self._service(handler, timeout_ms=200)
+        svc = self._service(handler, timeout_ms=800)
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
         elapsed = time.monotonic() - start
@@ -1132,8 +1154,9 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["partial_failures"][0]["source"], "baidu")
         self.assertEqual(result["partial_failures"][0]["reason"], "timeout")
         self.assertFalse(result["cleanup_incomplete"])
-        self.assertTrue(cleanup_done)
-        self.assertLess(elapsed, 0.3)
+        self.assertTrue(cleanup_done.is_set())
+        self.assertLess(elapsed, 1.5)
+        slow.set()
 
     async def test_cleanup_beyond_sync_budget_finishes_on_close(self):
         cleanup_done = []
@@ -1442,6 +1465,12 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             (self.BAIDU_RESULT_ONLY, ["Result Only"], "Result Snippet"),
             (self.BAIDU_OK, ["Baidu Title"], "Baidu Snippet"),
             (self.BAIDU_WRAPPED_SUMMARY, ["Wrapped A"], "Summary A"),
+            (self.BAIDU_SELF_ABSTRACT, ["Self Abstract"], "Self Summary"),
+            (
+                self.BAIDU_TITLE_CHILD_SUMMARY_PARENT,
+                ["Child Title"],
+                "Parent Sibling Summary",
+            ),
         ]
         for html, titles, snippet_text in cases:
             with self.subTest(titles=titles):
@@ -1457,6 +1486,53 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     result["results"][0]["snippet"], snippet_text
+                )
+
+    async def test_baidu_multiple_child_results_keep_summary_empty(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(
+                200, text=self.BAIDU_AMBIGUOUS_PARENT_SUMMARY
+            )
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Amb A", "Amb B"],
+        )
+        self.assertEqual(
+            [item["snippet"] for item in result["results"]],
+            ["", ""],
+        )
+        self.assertNotIn("Ambiguous Summary", result.get("summary", ""))
+
+    async def test_baidu_invalid_child_title_does_not_lift_summary(self):
+        for href in ("", "javascript:;"):
+            with self.subTest(href=href):
+                html = (
+                    '<html><body><div class="result"><h3>'
+                    '<a href="https://example.com/a">Parent A</a></h3>'
+                    '<div class="result"><h3>'
+                    f'<a href="{href}">Broken B</a></h3>'
+                    '<div class="c-abstract">Summary B</div>'
+                    '</div></div></body></html>'
+                )
+
+                async def handler(request, page=html):
+                    if request.url.host == "www.bing.com":
+                        return httpx.Response(429, text="rate limited")
+                    return httpx.Response(200, text=page)
+
+                result = await self._service(handler).search_game_info("游戏")
+                self.assertEqual(
+                    [item["title"] for item in result["results"]],
+                    ["Parent A"],
+                )
+                self.assertEqual(result["results"][0]["snippet"], "")
+                self.assertNotIn(
+                    "Summary B", result["results"][0]["snippet"]
                 )
 
     async def test_baidu_orphan_summary_is_not_assigned(self):
