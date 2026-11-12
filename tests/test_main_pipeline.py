@@ -251,6 +251,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_summarize_failure_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
+        plugin.search_summarize_max_chars = 120
         fake_ai = FakeAIClient(
             summarize_error=AIClientError("summary failed", "汇总失败")
         )
@@ -266,6 +267,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_summarize_disabled_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
         plugin.search_summarize_enabled = False
+        plugin.search_summarize_max_chars = 120
         fake_ai = FakeAIClient(summarize_text="SHOULD-NOT-BE-USED")
         plugin.ai_client = fake_ai
 
@@ -279,7 +281,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_fallback_prompt_keeps_multiple_items(self):
         plugin = make_plugin(search_result(count=3))
         plugin.search_summarize_enabled = False
-        plugin.search_summarize_max_chars = 40
+        plugin.search_summarize_max_chars = 120
         fake_ai = FakeAIClient(summarize_text="")
         plugin.ai_client = fake_ai
 
@@ -293,10 +295,11 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         digest = prompt.split(marker, 1)[1].split(
             "\n\n需要自动生成的字段：", 1
         )[0]
-        self.assertLessEqual(len(digest), 40)
+        self.assertLessEqual(len(digest), 120)
 
     async def test_summarize_empty_content_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
+        plugin.search_summarize_max_chars = 120
         fake_ai = FakeAIClient(summarize_text="")
         plugin.ai_client = fake_ai
 

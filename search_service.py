@@ -142,8 +142,12 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[:limit]
 
 
-def _truncate_balanced(text: str, max_chars: int) -> str:
-    """保留开头和结尾，避免长标题仅因前缀相同而无法区分。"""
+MIN_SUMMARY_ITEM_BUDGET = 32
+MIN_SUMMARY_HEADER_BUDGET = 18
+
+
+def _truncate_title(text: str, max_chars: int) -> str:
+    """保留标题开头、中部和结尾，尽量覆盖三处区分信息。"""
     text = (text or "").strip()
     try:
         limit = max(1, int(max_chars))
@@ -151,13 +155,31 @@ def _truncate_balanced(text: str, max_chars: int) -> str:
         limit = 150
     if len(text) <= limit:
         return text
-    if limit <= 6:
+    if limit <= 8:
         return text[:limit]
-    start = (limit - 1) * 3 // 5
-    end = limit - 1 - start
-    if start < 1 or end < 1:
-        return text[:limit]
-    return text[:start] + "…" + text[-end:]
+    body = limit - 2  # 两个省略号
+    head = max(1, body * 2 // 5)
+    middle = max(1, body * 3 // 10)
+    tail = max(1, body - head - middle)
+    if head + middle + tail > body:
+        middle = max(1, body - head - tail)
+    mid_start = max(0, (len(text) - middle) // 2)
+    return (
+        text[:head]
+        + "…"
+        + text[mid_start:mid_start + middle]
+        + "…"
+        + text[-tail:]
+    )
+
+
+def _summary_header(source: str, title: str, budget: int) -> str:
+    """来源标签必须完整；放不下标签时直接省略，不输出半截标签。"""
+    budget = max(1, int(budget))
+    label = f"[{source}] " if source else ""
+    if label and len(label) + 6 <= budget:
+        return label + _truncate_title(title, budget - len(label))
+    return _truncate_title(title, budget)
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -226,12 +248,14 @@ def build_search_summary(
     """把统一结果拼成供 AI 汇总/生成参考的文本。
 
     预算规则（确定、可测试）：
-    1. 先为每条结果保留可识别的标题和来源；标题预算均分，并保留
-       开头和结尾，避免长标题只截成相同前缀；
-    2. 摘要预留按实际摘要长度申请（最多 40%），短摘要不会占用固定空间；
-    3. 剩余预算优先均分给摘要；
-    4. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
-    5. 最终长度严格不超过总预算。
+    1. 空间不足时先减少结果条数，优先输出少量可识别、可提供事实的
+       片段，而不是保留大量标签/单字符碎片；
+    2. 来源标签必须完整，放不下时直接省略，绝不输出半截标签；
+    3. 标题保留开头、中部和结尾；标题预算按实际使用量回收；
+    4. 摘要预留按实际摘要长度申请（最多 40%），短摘要不会占固定空间；
+    5. 剩余预算优先均分给摘要；
+    6. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
+    7. 最终长度严格不超过总预算。
 
     总预算小到连分隔符/每条一个字符都放不下时，只保留第一条标题，
     不编造其他字段。
@@ -259,29 +283,47 @@ def build_search_summary(
         total = DEFAULT_SUMMARY_INPUT_MAX_CHARS
     total = max(1, total)
 
+    # 空间不足时先减少结果条数，而不是给每条留下标签/单字符碎片。
+    selected_count = 1
+    for candidate in range(len(items), 0, -1):
+        if (
+            candidate * MIN_SUMMARY_ITEM_BUDGET
+            + 2 * (candidate - 1)
+            <= total
+        ):
+            selected_count = candidate
+            break
+    items = items[:selected_count]
     count = len(items)
     separators = 2 * (count - 1)
-    if total <= separators:
-        return _truncate_text(items[0][1], total)
-
     available = total - separators
-    if available < count:
-        return _truncate_text(items[0][1], total)
 
-    # 摘要预留按实际需要的字符量回收，且最多占 40%。只有一条短摘要
-    # 时不会浪费 30% 给不存在的摘要，标题可获得更多可区分空间。
+    # 摘要预留按实际需要申请，且不能吃掉每条结果的最低标题预算。
     snippet_need = sum(
         1 + min(len(item[2]), MAX_SNIPPET_CHARS)
         for item in items
         if item[2]
     )
-    snippet_reserve = min(int(available * 0.4), snippet_need)
-    header_available = max(count, available - snippet_reserve)
+    # 选择条数时用较高的可识别门槛；真正分配时标题可以降到
+    # 18 字左右，给多条摘要保留合理空间。
+    max_reserve = max(
+        0, available - count * MIN_SUMMARY_HEADER_BUDGET
+    )
+    snippet_reserve = min(
+        int(available * 0.4), snippet_need, max_reserve
+    )
+    header_available = min(
+        available,
+        max(
+            count * MIN_SUMMARY_HEADER_BUDGET,
+            available - snippet_reserve,
+        ),
+    )
     header_share = max(1, header_available // count)
-    headers = []
-    for source, title, _snippet, _url in items:
-        header = f"[{source}] {title}" if source else title
-        headers.append(_truncate_balanced(header, header_share))
+    headers = [
+        _summary_header(source, title, header_share)
+        for source, title, _snippet, _url in items
+    ]
 
     blocks = list(headers)
     used = sum(len(block) for block in blocks)
@@ -887,7 +929,8 @@ class _BaiduResultParser(HTMLParser):
     @staticmethod
     def _is_result_start(attrs) -> bool:
         classes = (dict(attrs).get("class") or "").split()
-        return "result" in classes or "c-container" in classes
+        # 外层 c-container 可能包住多个 result，只有 result 才是结果边界。
+        return "result" in classes
 
     def _finish_title(self):
         self.in_title = False
@@ -935,12 +978,20 @@ class _BaiduResultParser(HTMLParser):
             and self.h3_depth > 0
             and not self.title_anchor_seen
         ):
-            href = dict(attrs).get("href") or ""
+            href = str(dict(attrs).get("href") or "").strip()
+            if (
+                not href
+                or href.startswith("#")
+                or href.lower().startswith("javascript:")
+            ):
+                return
+            resolved = urljoin("https://www.baidu.com", href)
+            if not _is_http_url(resolved):
+                return
             self.title_anchor_seen = True
             self.in_title = True
             self.title_parts = []
-            if href:
-                self.url = urljoin("https://www.baidu.com", str(href))
+            self.url = resolved
             return
 
         classes = (dict(attrs).get("class") or "").split()
@@ -1268,7 +1319,10 @@ class WebSearchBackend(SearchBackend):
         except Exception:
             return ("bing", "failed", [], "backend_error")
 
-        items = self._parse_bing(html)[:max_results]
+        # 先保留比 result_count 更多的候选供去重补位；仍设有上限，
+        # 不额外发请求、不无限收集页面结果。
+        candidate_limit = max(20, max_results * 4)
+        items = self._parse_bing(html)[:candidate_limit]
         if items:
             return ("bing", "success", items, "")
         if self._is_verification_page(html):
@@ -1298,7 +1352,8 @@ class WebSearchBackend(SearchBackend):
         except Exception:
             return ("baidu", "failed", [], "backend_error")
 
-        items = self._parse_baidu(html)[:max_results]
+        candidate_limit = max(20, max_results * 4)
+        items = self._parse_baidu(html)[:candidate_limit]
         if items:
             return ("baidu", "success", items, "")
         if self._is_verification_page(html):

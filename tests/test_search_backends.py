@@ -742,6 +742,21 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Baidu Snippet</div>'
         '</div></body></html>'
     )
+    BAIDU_NESTED = (
+        '<html><body><div class="c-container">'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/a">Title A</a></h3></div>'
+        '<div class="result"><h3>'
+        '<a href="https://example.com/b">Title B</a></h3>'
+        '<div class="c-abstract">B SNIPPET</div></div>'
+        '</div></body></html>'
+    )
+    BAIDU_ICON_ANCHOR = (
+        '<html><body><div class="result c-container"><h3>'
+        '<a href="">icon</a>'
+        '<a href="https://example.com/real">Real Title</a>'
+        '</h3><div class="c-abstract">Real Snippet</div></div></body></html>'
+    )
     BAIDU_MULTI = (
         '<html><body>'
         '<div class="result c-container" id="a">'
@@ -1330,6 +1345,44 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             {"Bing Path", "Bing Query", "Baidu Path", "Baidu Query"},
         )
 
+    async def test_duplicates_at_head_can_backfill_from_later_candidates(self):
+        bing = (
+            '<html><body><ol>'
+            '<li class="b_algo"><h2><a href="https://example.com/d1">'
+            'Bing 1</a></h2><p>S1</p></li>'
+            '<li class="b_algo"><h2><a href="https://example.com/d2">'
+            'Bing 2</a></h2><p>S2</p></li>'
+            '<li class="b_algo"><h2><a href="https://example.com/d1">'
+            'Bing 3 duplicate</a></h2><p>S3</p></li>'
+            '<li class="b_algo"><h2><a href="https://example.com/b4">'
+            'Bing 4 backfill</a></h2><p>S4</p></li>'
+            '</ol></body></html>'
+        )
+        baidu = (
+            '<html><body>'
+            '<div class="result c-container"><h3>'
+            '<a href="https://example.com/d1">Baidu 1</a></h3>'
+            '<div class="c-abstract">D1</div></div>'
+            '<div class="result c-container"><h3>'
+            '<a href="https://example.com/d2">Baidu 2</a></h3>'
+            '<div class="c-abstract">D2</div></div>'
+            '</body></html>'
+        )
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=bing)
+            return httpx.Response(200, text=baidu)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 3)
+        self.assertIn(
+            "Bing 4 backfill",
+            {item["title"] for item in result["results"]},
+        )
+
     async def test_single_source_fills_remaining_slots(self):
         async def bing_only(request):
             if request.url.host == "www.bing.com":
@@ -1352,6 +1405,40 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {item["source"] for item in baidu_result["results"]}, {"baidu"}
         )
+
+    async def test_baidu_outer_container_keeps_child_results(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_NESTED)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        first, second = result["results"]
+        self.assertEqual(first["title"], "Title A")
+        self.assertEqual(first["url"], "https://example.com/a")
+        self.assertEqual(first["snippet"], "")
+        self.assertEqual(second["title"], "Title B")
+        self.assertEqual(second["url"], "https://example.com/b")
+        self.assertEqual(second["snippet"], "B SNIPPET")
+
+    async def test_baidu_icon_anchor_does_not_hide_title(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_ICON_ANCHOR)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["results"][0]["title"], "Real Title")
+        self.assertEqual(
+            result["results"][0]["url"], "https://example.com/real"
+        )
+        self.assertEqual(result["results"][0]["snippet"], "Real Snippet")
 
     async def test_baidu_container_excludes_content_right_ad(self):
         async def handler(request):
@@ -1548,6 +1635,80 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(long_url, text)
         self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_ten_results_budget_50_uses_few_readable_items(self):
+        results = [
+            item(
+                title=f"Result-{index}-" + "T" * 80,
+                url=f"https://example.com/{index}",
+                snippet="",
+                source=f"source{index}",
+            )
+            for index in range(10)
+        ]
+        text = build_search_summary(results, max_total_chars=50)
+
+        self.assertLessEqual(len(text), 50)
+        self.assertNotIn("\n\n", text)
+        self.assertIn("[source0]", text)
+        self.assertIn("Result-0", text)
+        self.assertNotIn("Result-1", text)
+
+    def test_ten_results_budget_50_source_labels_are_not_partial(self):
+        results = [
+            item(
+                title=f"Result-{index}",
+                url="",
+                snippet="",
+                source=f"very-long-source-{index}",
+            )
+            for index in range(10)
+        ]
+        text = build_search_summary(results, max_total_chars=50)
+
+        self.assertLessEqual(len(text), 50)
+        self.assertIn("[very-long-source-0]", text)
+        self.assertNotIn("[very-long-source-1]", text)
+
+    def test_five_similar_titles_middle_markers_survive(self):
+        results = [
+            item(
+                title="COMMON-" + "A" * 80 + f"MID-{index}" + "B" * 80
+                + "-TAIL",
+                url=f"https://example.com/{index}",
+                snippet="Short" if index == 0 else "",
+                source=f"s{index}",
+            )
+            for index in range(5)
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        for index in range(5):
+            self.assertIn(f"MID-{index}", text)
+
+    def test_title_differences_at_start_middle_end_survive(self):
+        results = [
+            item(
+                title=f"START-0-" + "A" * 100 + "COMMON-TAIL",
+                source="s0",
+            ),
+            item(
+                title="COMMON-" + "A" * 45 + "MIDDLE-1" + "B" * 45
+                + "-COMMON",
+                source="s1",
+            ),
+            item(
+                title="COMMON-HEAD-" + "A" * 100 + "-END-2",
+                source="s2",
+            ),
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        self.assertIn("START-0", text)
+        self.assertIn("MIDDLE-1", text)
+        self.assertIn("END-2", text)
 
     def test_total_budget_200_five_long_titles_one_short_snippet(self):
         results = [
