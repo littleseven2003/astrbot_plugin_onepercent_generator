@@ -737,9 +737,33 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '</ol></body></html>'
     )
     BAIDU_OK = (
-        '<html><body>'
+        '<html><body><div class="result c-container">'
         '<h3><a href="https://example.com/baidu">Baidu Title</a></h3>'
         '<div class="c-abstract">Baidu Snippet</div>'
+        '</div></body></html>'
+    )
+    BAIDU_MULTI = (
+        '<html><body>'
+        '<div class="result c-container" id="a">'
+        '<h3><a href="https://example.com/baidu-a">Baidu A</a></h3>'
+        '<div class="c-abstract">A <span>nested</span> snippet</div>'
+        '</div>'
+        '<div class="content-right">AD MUST NOT BE USED</div>'
+        '<div class="result c-container" id="b">'
+        '<h3><a href="https://example.com/baidu-b">Baidu B</a></h3>'
+        '<div class="c-abstract">B snippet</div>'
+        '</div>'
+        '</body></html>'
+    )
+    BAIDU_MISSING_SNIPPET = (
+        '<html><body>'
+        '<div class="result c-container" id="a">'
+        '<h3><a href="https://example.com/baidu-a">Baidu A</a></h3>'
+        '</div>'
+        '<div class="content-right">AD MUST NOT BE USED</div>'
+        '<div class="result c-container" id="b">'
+        '<h3><a href="https://example.com/baidu-b">Baidu B</a></h3>'
+        '</div>'
         '</body></html>'
     )
     BING_NESTED = (
@@ -761,6 +785,29 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<ul><li>Two nested child</li></ul>'
         '<p>Two Snippet</p></li>'
         '</ol></body></html>'
+    )
+    BING_THREE = (
+        '<html><body><ol>'
+        '<li class="b_algo"><h2><a href="https://example.com/b1">'
+        'Bing 1</a></h2><p>Bing Snippet 1</p></li>'
+        '<li class="b_algo"><h2><a href="https://example.com/b2">'
+        'Bing 2</a></h2><p>Bing Snippet 2</p></li>'
+        '<li class="b_algo"><h2><a href="https://example.com/b3">'
+        'Bing 3</a></h2><p>Bing Snippet 3</p></li>'
+        '</ol></body></html>'
+    )
+    BAIDU_THREE = (
+        '<html><body>'
+        '<div class="result c-container"><h3>'
+        '<a href="https://example.com/d1">Baidu 1</a></h3>'
+        '<div class="c-abstract">Baidu Snippet 1</div></div>'
+        '<div class="result c-container"><h3>'
+        '<a href="https://example.com/d2">Baidu 2</a></h3>'
+        '<div class="c-abstract">Baidu Snippet 2</div></div>'
+        '<div class="result c-container"><h3>'
+        '<a href="https://example.com/d3">Baidu 3</a></h3>'
+        '<div class="c-abstract">Baidu Snippet 3</div></div>'
+        '</body></html>'
     )
     BING_MULTI_ANCHOR = (
         '<html><body><ol><li class="b_algo"><h2>'
@@ -792,13 +839,15 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '</ol></body></html>'
     )
 
-    def _service(self, handler, mode="web", timeout_ms=2000):
+    def _service(
+        self, handler, mode="web", timeout_ms=2000, result_count=3
+    ):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(client.aclose)
         svc = SearchService(
             mode=mode,
             timeout_ms=timeout_ms,
-            result_count=3,
+            result_count=result_count,
             web_client=client,
         )
         self.addAsyncCleanup(svc.close)
@@ -1201,6 +1250,143 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.5)
         self.assertIn("baidu", cancelled)
 
+    async def test_dual_sources_interleave_with_default_result_count(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_THREE)
+            return httpx.Response(200, text=self.BAIDU_THREE)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 3)
+        self.assertEqual(
+            [item["source"] for item in result["results"]],
+            ["bing", "baidu", "bing"],
+        )
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Bing 1", "Baidu 1", "Bing 2"],
+        )
+
+    async def test_cross_source_duplicate_is_removed(self):
+        bing = (
+            '<html><body><ol><li class="b_algo"><h2>'
+            '<a href="HTTPS://EXAMPLE.COM/Path?Q=1">Bing Dup</a>'
+            '</h2><p>Bing</p></li></ol></body></html>'
+        )
+        baidu = (
+            '<html><body><div class="result c-container"><h3>'
+            '<a href="https://example.com/Path?Q=1">Baidu Dup</a></h3>'
+            '<div class="c-abstract">Baidu</div></div></body></html>'
+        )
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=bing)
+            return httpx.Response(200, text=baidu)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["results"][0]["title"], "Bing Dup")
+
+    async def test_path_and_query_case_are_not_deduped(self):
+        bing = (
+            '<html><body><ol>'
+            '<li class="b_algo"><h2>'
+            '<a href="https://example.com/Path?A=1">Bing Path</a>'
+            '</h2><p>Bing Path</p></li>'
+            '<li class="b_algo"><h2>'
+            '<a href="https://example.com/same?A=1">Bing Query</a>'
+            '</h2><p>Bing Query</p></li>'
+            '</ol></body></html>'
+        )
+        baidu = (
+            '<html><body>'
+            '<div class="result c-container"><h3>'
+            '<a href="https://example.com/path?A=1">Baidu Path</a></h3>'
+            '<div class="c-abstract">Baidu Path</div></div>'
+            '<div class="result c-container"><h3>'
+            '<a href="https://example.com/same?a=1">Baidu Query</a></h3>'
+            '<div class="c-abstract">Baidu Query</div></div>'
+            '</body></html>'
+        )
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=bing)
+            return httpx.Response(200, text=baidu)
+
+        result = await self._service(
+            handler, result_count=4
+        ).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 4)
+        self.assertEqual(
+            {item["title"] for item in result["results"]},
+            {"Bing Path", "Bing Query", "Baidu Path", "Baidu Query"},
+        )
+
+    async def test_single_source_fills_remaining_slots(self):
+        async def bing_only(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_THREE)
+            return httpx.Response(429, text="rate limited")
+
+        bing_result = await self._service(bing_only).search_game_info("游戏")
+        self.assertEqual(len(bing_result["results"]), 3)
+        self.assertEqual(
+            {item["source"] for item in bing_result["results"]}, {"bing"}
+        )
+
+        async def baidu_only(request):
+            if request.url.host == "www.baidu.com":
+                return httpx.Response(200, text=self.BAIDU_THREE)
+            return httpx.Response(429, text="rate limited")
+
+        baidu_result = await self._service(baidu_only).search_game_info("游戏")
+        self.assertEqual(len(baidu_result["results"]), 3)
+        self.assertEqual(
+            {item["source"] for item in baidu_result["results"]}, {"baidu"}
+        )
+
+    async def test_baidu_container_excludes_content_right_ad(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_MULTI)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        first, second = result["results"]
+        self.assertEqual(first["title"], "Baidu A")
+        self.assertEqual(first["url"], "https://example.com/baidu-a")
+        self.assertEqual(first["snippet"], "A nested snippet")
+        self.assertEqual(second["title"], "Baidu B")
+        self.assertEqual(second["url"], "https://example.com/baidu-b")
+        self.assertEqual(second["snippet"], "B snippet")
+        self.assertNotIn("AD MUST NOT BE USED", first["snippet"])
+        self.assertNotIn("AD MUST NOT BE USED", second["snippet"])
+
+    async def test_baidu_missing_snippet_is_empty_and_does_not_take_ad(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_MISSING_SNIPPET)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertEqual(result["results"][1]["snippet"], "")
+        self.assertNotIn("AD MUST NOT BE USED", str(result["results"]))
+
     async def test_baidu_success_bing_slow_is_partial(self):
         cancelled = []
 
@@ -1362,6 +1548,54 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(long_url, text)
         self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_total_budget_200_five_long_titles_one_short_snippet(self):
+        results = [
+            item(
+                title="CommonPrefix-" + "T" * 200 + f"-END-{index}",
+                url=f"https://example.com/{index}",
+                snippet="Short" if index == 0 else "",
+                source=f"s{index}",
+            )
+            for index in range(5)
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        for index in range(5):
+            self.assertIn(f"[s{index}]", text)
+            self.assertIn(f"-END-{index}", text)
+        self.assertIn("Short", text)
+
+    def test_first_long_item_does_not_hide_later_items(self):
+        results = [
+            item(
+                title="First-" + "T" * 300,
+                url="https://example.com/first",
+                snippet="S" * 3000,
+                source="s0",
+            ),
+            item(
+                title="Second Valid",
+                url="https://example.com/second",
+                snippet="Second Snippet",
+                source="s1",
+            ),
+            item(
+                title="Third Valid",
+                url="https://example.com/third",
+                snippet="Third Snippet",
+                source="s2",
+            ),
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        self.assertIn("First", text)
+        self.assertIn("Second Valid", text)
+        self.assertIn("Third Valid", text)
+        self.assertIn("Second Snippet", text)
+        self.assertIn("Third Snippet", text)
 
     def test_total_budget_200_five_long_results_keep_headers_and_snippets(self):
         results = [

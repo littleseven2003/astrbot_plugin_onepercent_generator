@@ -249,7 +249,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m["text"].startswith("什么是【我的百分之一】")
                             for m in messages))
 
-    async def test_summarize_failure_falls_back_to_raw_truncated(self):
+    async def test_summarize_failure_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
         fake_ai = FakeAIClient(
             summarize_error=AIClientError("summary failed", "汇总失败")
@@ -258,11 +258,12 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run(plugin)
 
-        expected = ("RAW" * 200)[:40]
-        self.assertIn(expected, fake_ai.prompts[0])
-        self.assertNotIn("RAW" * 200, fake_ai.prompts[0])
+        prompt = fake_ai.prompts[0]
+        self.assertIn("T0", prompt)
+        self.assertIn("T1", prompt)
+        self.assertNotIn("RAW" * 200, prompt)
 
-    async def test_summarize_disabled_uses_raw_truncated(self):
+    async def test_summarize_disabled_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
         plugin.search_summarize_enabled = False
         fake_ai = FakeAIClient(summarize_text="SHOULD-NOT-BE-USED")
@@ -271,11 +272,45 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         await self._run(plugin)
 
         self.assertEqual(len(fake_ai.summarize_calls), 0)
-        self.assertIn(("RAW" * 200)[:40], fake_ai.prompts[0])
+        self.assertIn("T0", fake_ai.prompts[0])
+        self.assertIn("T1", fake_ai.prompts[0])
         self.assertNotIn("SHOULD-NOT-BE-USED", fake_ai.prompts[0])
 
+    async def test_fallback_prompt_keeps_multiple_items(self):
+        plugin = make_plugin(search_result(count=3))
+        plugin.search_summarize_enabled = False
+        plugin.search_summarize_max_chars = 40
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        await self._run(plugin)
+
+        prompt = fake_ai.prompts[0]
+        self.assertIn("T0", prompt)
+        self.assertIn("T1", prompt)
+        self.assertIn("T2", prompt)
+        marker = "联网搜索到的游戏信息摘要：\n"
+        digest = prompt.split(marker, 1)[1].split(
+            "\n\n需要自动生成的字段：", 1
+        )[0]
+        self.assertLessEqual(len(digest), 40)
+
+    async def test_summarize_empty_content_rebuilds_structured_summary(self):
+        plugin = make_plugin(search_result())
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        await self._run(plugin)
+
+        self.assertEqual(len(fake_ai.summarize_calls), 1)
+        self.assertIn("T0", fake_ai.prompts[0])
+        self.assertIn("T1", fake_ai.prompts[0])
+
     async def test_summary_input_capped_before_ai_summarize(self):
-        plugin = make_plugin(search_result(summary="R" * 2000))
+        result = search_result(summary="R" * 2000)
+        result["results"][0]["snippet"] = "R" * 2000
+        result["results"][1]["snippet"] = "R" * 2000
+        plugin = make_plugin(result)
         plugin.search_summary_input_max_chars = 120
         fake_ai = FakeAIClient(summarize_text="AI" * 200)
         plugin.ai_client = fake_ai

@@ -142,6 +142,24 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[:limit]
 
 
+def _truncate_balanced(text: str, max_chars: int) -> str:
+    """保留开头和结尾，避免长标题仅因前缀相同而无法区分。"""
+    text = (text or "").strip()
+    try:
+        limit = max(1, int(max_chars))
+    except (TypeError, ValueError):
+        limit = 150
+    if len(text) <= limit:
+        return text
+    if limit <= 6:
+        return text[:limit]
+    start = (limit - 1) * 3 // 5
+    end = limit - 1 - start
+    if start < 1 or end < 1:
+        return text[:limit]
+    return text[:start] + "…" + text[-end:]
+
+
 def _is_loopback_host(host: str | None) -> bool:
     if not host:
         return False
@@ -150,6 +168,26 @@ def _is_loopback_host(host: str | None) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _url_dedupe_key(url: str):
+    """只规范化 scheme/hostname；path/query/fragment 保留原始大小写。"""
+    try:
+        parsed = urlparse(str(url))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ("raw", str(url))
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return ("raw", str(url))
+    return (
+        parsed.scheme.lower(),
+        parsed.hostname.lower(),
+        port,
+        parsed.path or "/",
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
+    )
 
 
 def _is_http_url(url: str) -> bool:
@@ -188,10 +226,12 @@ def build_search_summary(
     """把统一结果拼成供 AI 汇总/生成参考的文本。
 
     预算规则（确定、可测试）：
-    1. 先为每条结果保留可识别的标题和来源，所有条目均分标题预算；
-    2. 剩余预算优先均分给摘要；
-    3. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
-    4. 最终长度严格不超过总预算。
+    1. 先为每条结果保留可识别的标题和来源；标题预算均分，并保留
+       开头和结尾，避免长标题只截成相同前缀；
+    2. 摘要预留按实际摘要长度申请（最多 40%），短摘要不会占用固定空间；
+    3. 剩余预算优先均分给摘要；
+    4. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
+    5. 最终长度严格不超过总预算。
 
     总预算小到连分隔符/每条一个字符都放不下时，只保留第一条标题，
     不编造其他字段。
@@ -228,20 +268,20 @@ def build_search_summary(
     if available < count:
         return _truncate_text(items[0][1], total)
 
-    # 有摘要时为摘要预留约 30% 的总预算，避免五条长标题把摘要空间
-    # 全部吃掉；标题仍均分剩余预算，保证每条结果可识别。
-    has_snippets = any(item[2] for item in items)
-    snippet_reserve = 0
-    if has_snippets:
-        snippet_reserve = min(
-            available // 2, max(20, int(available * 0.3))
-        )
+    # 摘要预留按实际需要的字符量回收，且最多占 40%。只有一条短摘要
+    # 时不会浪费 30% 给不存在的摘要，标题可获得更多可区分空间。
+    snippet_need = sum(
+        1 + min(len(item[2]), MAX_SNIPPET_CHARS)
+        for item in items
+        if item[2]
+    )
+    snippet_reserve = min(int(available * 0.4), snippet_need)
     header_available = max(count, available - snippet_reserve)
     header_share = max(1, header_available // count)
     headers = []
     for source, title, _snippet, _url in items:
         header = f"[{source}] {title}" if source else title
-        headers.append(_truncate_text(header, header_share))
+        headers.append(_truncate_balanced(header, header_share))
 
     blocks = list(headers)
     used = sum(len(block) for block in blocks)
@@ -816,6 +856,132 @@ class _BingResultParser(HTMLParser):
             self.snippet_parts.append(data)
 
 
+class _BaiduResultParser(HTMLParser):
+    """在 Baidu result/c-container 容器内收集标题、URL、摘要。
+
+    摘要只接受容器内 c-abstract/abstract；容器外的 content-right 广告
+    不会进入当前结果。容器内缺少摘要时留空，不向后拼接。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.div_depth = 0
+        self.result_depth: int | None = None
+        self.tag_depth: dict[str, int] = {}
+        self.results: list[dict] = []
+        self._reset_result()
+
+    def _reset_result(self):
+        self.in_title = False
+        self.title_anchor_seen = False
+        self.title_parts: list[str] = []
+        self.url = ""
+        self.h3_depth = 0
+        self.in_snippet = False
+        self.snippet_tag: str | None = None
+        self.snippet_tag_depth = 0
+        self.snippet_parts: list[str] = []
+        self.snippet = ""
+        self.snippet_found = False
+
+    @staticmethod
+    def _is_result_start(attrs) -> bool:
+        classes = (dict(attrs).get("class") or "").split()
+        return "result" in classes or "c-container" in classes
+
+    def _finish_title(self):
+        self.in_title = False
+
+    def _finish_snippet(self):
+        if not self.in_snippet:
+            return
+        text = "".join(self.snippet_parts).strip()
+        if text and not self.snippet_found:
+            self.snippet = text
+            self.snippet_found = True
+        self.in_snippet = False
+        self.snippet_tag = None
+        self.snippet_parts = []
+
+    def _finish_result(self):
+        self._finish_title()
+        self._finish_snippet()
+        title = "".join(self.title_parts).strip()
+        if title:
+            self.results.append({
+                "title": title,
+                "url": self.url,
+                "snippet": self.snippet,
+            })
+
+    def handle_starttag(self, tag, attrs):
+        self.tag_depth[tag] = self.tag_depth.get(tag, 0) + 1
+        if tag == "div":
+            self.div_depth += 1
+            if (
+                self.result_depth is None
+                and self._is_result_start(attrs)
+            ):
+                self.result_depth = self.div_depth
+                self._reset_result()
+
+        if self.result_depth is None:
+            return
+        if tag == "h3":
+            self.h3_depth += 1
+            return
+        if (
+            tag == "a"
+            and self.h3_depth > 0
+            and not self.title_anchor_seen
+        ):
+            href = dict(attrs).get("href") or ""
+            self.title_anchor_seen = True
+            self.in_title = True
+            self.title_parts = []
+            if href:
+                self.url = urljoin("https://www.baidu.com", str(href))
+            return
+
+        classes = (dict(attrs).get("class") or "").split()
+        if (
+            ("c-abstract" in classes or "abstract" in classes)
+            and not self.in_snippet
+            and not self.snippet_found
+        ):
+            self.in_snippet = True
+            self.snippet_tag = tag
+            self.snippet_tag_depth = self.tag_depth.get(tag, 0)
+            self.snippet_parts = []
+
+    def handle_endtag(self, tag):
+        if self.result_depth is not None:
+            if tag == "a" and self.in_title:
+                self._finish_title()
+            elif tag == "h3":
+                self.h3_depth = max(0, self.h3_depth - 1)
+            if (
+                tag == self.snippet_tag
+                and self.in_snippet
+                and self.tag_depth.get(tag, 0) == self.snippet_tag_depth
+            ):
+                self._finish_snippet()
+            if tag == "div" and self.div_depth == self.result_depth:
+                self._finish_result()
+                self.result_depth = None
+
+        if self.tag_depth.get(tag, 0) > 0:
+            self.tag_depth[tag] -= 1
+        if tag == "div":
+            self.div_depth = max(0, self.div_depth - 1)
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_snippet:
+            self.snippet_parts.append(data)
+
+
 class WebSearchBackend(SearchBackend):
     """Bing + 百度搜索页尽力而为后端；不抓取结果链接正文。"""
 
@@ -986,24 +1152,49 @@ class WebSearchBackend(SearchBackend):
                 continue
             source_results.append(task.result())
 
-        merged: list[dict] = []
-        seen: set[str] = set()
         failures: list[dict] = []
+        source_queues: dict[str, list[dict]] = {}
+        source_order: list[str] = []
         for label, status, items, reason in source_results:
-            if status == "success":
-                for item in items:
-                    key = item["url"].strip().lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(item)
-            else:
+            if status != "success":
                 failures.append({
                     "source": label,
                     "status": status,
                     "reason": reason or status,
                 })
-        merged = merged[:max_results]
+                continue
+            queue = []
+            local_seen = set()
+            for item in items:
+                key = _url_dedupe_key(item.get("url", ""))
+                if key in local_seen:
+                    continue
+                local_seen.add(key)
+                queue.append(item)
+            source_queues[label] = queue
+            source_order.append(label)
+
+        # 双源成功时轮转交错，避免 Bing 固定占满 result_count；
+        # 单源失败/无结果时，另一来源的队列会自然填满剩余名额。
+        merged: list[dict] = []
+        seen = set()
+        while len(merged) < max_results:
+            progressed = False
+            for label in source_order:
+                queue = source_queues.get(label, [])
+                while queue:
+                    item = queue.pop(0)
+                    key = _url_dedupe_key(item.get("url", ""))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(item)
+                    progressed = True
+                    break
+                if len(merged) >= max_results:
+                    break
+            if not progressed:
+                break
         duration_ms = int((time.monotonic() - start) * 1000)
 
         if merged:
@@ -1153,32 +1344,20 @@ class WebSearchBackend(SearchBackend):
 
     @staticmethod
     def _parse_baidu(html: str) -> list[dict]:
-        anchors = list(
-            re.finditer(
-                r'<h3[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?</h3>',
-                html,
-                re.DOTALL | re.IGNORECASE,
-            )
-        )
+        parser = _BaiduResultParser()
+        try:
+            parser.feed(html)
+            parser.close()
+        except Exception:
+            pass
         items = []
-        for index, anchor in enumerate(anchors):
-            url = urljoin("https://www.baidu.com", html_lib.unescape(anchor.group(1)))
-            title = _strip_html(anchor.group(2))
-            end = (
-                anchors[index + 1].start()
-                if index + 1 < len(anchors)
-                else min(len(html), anchor.end() + 2500)
-            )
-            chunk = html[anchor.end():end]
-            abstract = re.search(
-                r'class="[^"]*(?:c-abstract|content-right|abstract)[^"]*"[^>]*>(.*?)</(?:div|span)>',
-                chunk,
-                re.DOTALL | re.IGNORECASE,
-            )
-            snippet = _strip_html(abstract.group(1)) if abstract else ""
-            item = _normalize_item(
-                {"title": title, "url": url, "snippet": snippet, "source": "baidu"}
-            )
+        for result in parser.results:
+            item = _normalize_item({
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "source": "baidu",
+            })
             if item:
                 items.append(item)
         return items

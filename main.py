@@ -16,6 +16,7 @@ from .rate_limiter import RateLimiter
 from .search_service import (
     BACKEND_LABELS,
     SearchService,
+    build_search_summary,
     format_source_failures,
     prepare_search_digest,
 )
@@ -191,11 +192,17 @@ class OnePercentGenerator(Star):
         search_result = await self.search_service.search_game_info(
             game_name, event=event
         )
-        raw_summary = prepare_search_digest(
-            search_result.get("summary", ""),
-            "",
+        search_results = search_result.get("results") or []
+        raw_summary = build_search_summary(
+            search_results,
             self.search_summary_input_max_chars,
         )
+        if not raw_summary:
+            raw_summary = prepare_search_digest(
+                search_result.get("summary", ""),
+                "",
+                self.search_summary_input_max_chars,
+            )
         logger.info(
             "[小作文生成器] 搜索状态: %s, 后端: %s, 有效结果: %s, 游戏: %s",
             search_result.get("status"),
@@ -211,21 +218,31 @@ class OnePercentGenerator(Star):
                 digest_result = await self.ai_client.summarize_search(
                     game_name, raw_summary, self.search_summarize_max_chars
                 )
-                ai_digest = digest_result["content"]
+                ai_digest = str(digest_result.get("content") or "")
                 logger.info(
                     "[小作文生成器] 搜索汇总完成: %s 字符",
                     len(ai_digest),
                 )
             except AIClientError as e:
                 logger.warning(
-                    "[小作文生成器] 搜索汇总失败，使用原始摘要: %s",
+                    "[小作文生成器] 搜索汇总失败，回退结构化摘要: %s",
                     e,
                 )
-        search_digest = prepare_search_digest(
-            raw_summary,
-            ai_digest,
-            self.search_summarize_max_chars,
-        )
+        final_budget = self.search_summarize_max_chars
+        if (ai_digest or "").strip():
+            search_digest = prepare_search_digest(
+                "", ai_digest, final_budget
+            )
+        else:
+            # AI 汇总关闭/失败/返回空时，从结构化结果重新构建平衡摘要；
+            # 不能简单截断已拼接字符串，否则往往只剩第一条。
+            search_digest = build_search_summary(
+                search_results, final_budget
+            )
+            if not search_digest:
+                search_digest = prepare_search_digest(
+                    raw_summary, "", final_budget
+                )
 
         # 组装 Prompt（使用已受字数预算约束的搜索汇总）
         prompt = build_main_prompt(game_name, search_digest)
