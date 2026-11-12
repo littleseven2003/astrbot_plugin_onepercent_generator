@@ -5,7 +5,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/blob/main/LICENSE)
-[![Release](https://img.shields.io/badge/Release-v0.3.4-green?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
+[![Release](https://img.shields.io/github/v/release/littleseven2003/astrbot_plugin_onepercent_generator?style=flat)](https://github.com/littleseven2003/astrbot_plugin_onepercent_generator/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange?style=flat&logo=robot&logoColor=white)](https://github.com/Soulter/AstrBot)
 
@@ -16,11 +16,11 @@
 ## ✨ 核心特性
 
 * 🎮 **关键词触发**：发送「小作文」或「我的百分之一」即可触发，支持随机游戏或指定游戏生成
-* 🔍 **联网搜索**：自动搜索游戏公开资料（Bing → 百度多源 fallback），让 AI 生成更贴合实际的内容
+* 🔍 **联网搜索**：并发搜索 Bing 和百度结果页，为生成提供公开资料参考；搜索结果可能受页面变化或验证机制影响
 * ✅ **格式一致**：完全复现原项目 Prompt 与后处理逻辑，游戏名由程序拼装不经过 AI
-* ⏱️ **频率限制**：基于 QQ 号的滑动窗口 + 每日上限双重限制，防止滥用
+* ⏱️ **频率限制**：基于 QQ 号的固定时间窗口 + 每日上限双重限制，防止滥用
 * 📋 **白名单控制**：可配置白名单群聊/私聊列表，精准控制功能使用范围
-* 🔧 **模型兼容**：兼容 OpenAI 格式 API（DeepSeek / OpenAI / 通义千问等）
+* 🔧 **模型兼容**：可在设置菜单选择 Chat Completions 或 Responses API 格式
 
 ---
 
@@ -51,7 +51,11 @@ pip install httpx
 | :--- | :--- | :--- |
 | API Base URL | 兼容 OpenAI 格式的 API 地址 | `https://api.deepseek.com/v1` |
 | API Key | 你的 API 密钥 | `sk-xxxxxxxx` |
+| API 格式 | 服务使用的接口格式 | `chat_completions` 或 `responses` |
+| 发送 temperature 参数 | 服务不接受该参数时可关闭，默认开启 | `true` / `false` |
 | 模型名称 | 使用的模型 | `deepseek-chat` |
+
+已有配置会继续使用 `chat_completions`，并默认发送 `temperature`。当服务要求 OpenAI Responses API 时，将 API 格式切换为 `responses`；插件会调用 `{Base URL}/responses`，无需把 `/responses` 手动写入 Base URL。部分模型不接受 `temperature` 参数，可在配置中关闭「发送 temperature 参数」；关闭后两种 API 格式均不发送该参数。具体支持情况以模型服务商文档为准。
 
 ### 步骤 3：配置管理员（可选）
 
@@ -130,9 +134,11 @@ pip install httpx
 | 管理员QQ号列表 | 列表 | 支持多个管理员 | 空 |
 | AI Base URL | 字符串 | API 地址，兼容 OpenAI 格式 | — |
 | AI API Key | 字符串 | API 密钥 | — |
+| AI API 格式 | 下拉选项 | Chat Completions 或 Responses API | `chat_completions` |
+| 发送 temperature 参数 | 布尔 | 关闭后两种 API 格式均不发送该参数 | `true` |
 | AI Model | 字符串 | 模型名称 | `deepseek-chat` |
 | 预设游戏列表 | 列表 | 随机生成时的游戏池 | 原神、星露谷物语、艾尔登法环、塞尔达传说：王国之泪、博德之门3 |
-| 限制时间窗口 | 整数 | 滑动窗口（分钟） | `10` |
+| 限制时间窗口 | 整数 | 从窗口首次请求开始计时的固定窗口（分钟） | `10` |
 | 窗口内最大请求次数 | 整数 | 每 QQ 号窗口内限制 | `3` |
 | 每日最大请求次数 | 整数 | 每 QQ 号每日限制 | `20` |
 | 是否启用联网搜索 | 布尔 | 是否搜索游戏资料 | `true` |
@@ -147,7 +153,7 @@ pip install httpx
 ### 频率限制说明
 
 - 限制基于 QQ 号**全局生效**，不区分群聊或私聊
-- 滑动窗口与每日上限双重限制
+- 固定时间窗口与每日上限双重限制
 - 管理员不受频率限制
 - `/小作文模型测试` 不受频率限制
 
@@ -172,7 +178,8 @@ pip install httpx
 ├── README.md                  # 说明文档
 └── docs/                      # 项目文档
     ├── Design.md              # 详细设计文档
-    └── CHANGELOG.md           # 更新日志
+    ├── CHANGELOG.md           # 更新日志
+    └── VERSIONING.md          # 分支、版本与发布约定
 ```
 
 ---

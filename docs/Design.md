@@ -48,6 +48,7 @@ QQ 消息
 
 - `ai_config.base_url`：兼容服务的 API 根地址，末尾斜杠会被移除。
 - `ai_config.api_key`：Bearer Token，不写入日志。
+- `ai_config.api_format`：`chat_completions` 或 `responses`，默认保持前者以兼容已有配置。
 - `ai_config.model`：提交给服务端的模型标识。
 
 ### 搜索配置
@@ -70,7 +71,14 @@ QQ 消息
 
 ### AI 服务
 
-当前版本通过 `POST {base_url}/chat/completions` 调用兼容 OpenAI Chat Completions 的服务。请求包含 system/user 两条消息，响应正文来自 `choices[0].message.content`。
+根据 `ai_config.api_format` 选择调用方式：
+
+| 格式 | 地址 | 主要请求字段 | 正文来源 |
+| --- | --- | --- | --- |
+| `chat_completions` | `POST {base_url}/chat/completions` | `messages`、`max_tokens` | `choices[0].message.content` |
+| `responses` | `POST {base_url}/responses` | `instructions`、`input`、`max_output_tokens` | `output` 中消息项目的 `output_text` 内容 |
+
+Responses 请求显式使用 `store: false`，避免无状态的插件生成请求被服务端默认保存。解析器同时兼容部分服务直接返回顶层 `output_text` 的情况。
 
 所有 AI 调用统一转换为：
 
@@ -83,7 +91,7 @@ token_usage.completion_tokens
 token_usage.total_tokens
 ```
 
-上层流程不直接依赖服务端原始响应结构。
+Responses 的 `input_tokens` 和 `output_tokens` 会分别归一化为 `prompt_tokens` 和 `completion_tokens`，上层流程不直接依赖服务端原始响应结构。
 
 ### 搜索服务
 

@@ -20,6 +20,20 @@
         "hint": "输入你的 API Key",
         "obvious_hint": true
       },
+      "api_format": {
+        "description": "API 格式",
+        "type": "string",
+        "options": ["chat_completions", "responses"],
+        "labels": ["Chat Completions（/chat/completions）", "Responses（/responses）"],
+        "default": "chat_completions",
+        "hint": "选择模型服务使用的 OpenAI 兼容接口格式。已有配置默认继续使用 Chat Completions"
+      },
+      "send_temperature": {
+        "description": "发送 temperature 参数",
+        "type": "bool",
+        "default": true,
+        "hint": "默认开启以保持旧配置行为。部分推理模型（如 o 系列，或推理强度非 none 的新模型）不接受 temperature，可按服务要求关闭；关闭后两种 API 格式的请求都不包含该参数。"
+      },
       "model": {
         "description": "模型名称",
         "type": "string",
