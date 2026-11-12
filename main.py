@@ -263,6 +263,11 @@ class OnePercentGenerator(Star):
             search_partial_failures = format_source_failures(
                 search_result.get("partial_failures", [])
             )
+            search_cleanup = (
+                "未完成"
+                if search_result.get("cleanup_incomplete")
+                else "完成"
+            )
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)
@@ -284,6 +289,7 @@ class OnePercentGenerator(Star):
                 f"搜索降级：{search_degraded}",
                 f"有效结果：{search_valid_count}",
                 f"搜索部分可用：{search_partial}",
+                f"搜索清理：{search_cleanup}",
                 *(
                     [f"部分失败来源：{search_partial_failures}"]
                     if search_partial_failures

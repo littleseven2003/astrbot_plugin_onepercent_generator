@@ -609,7 +609,7 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
             "HTTPS_PROXY": "http://203.0.113.10:8080",
             "ALL_PROXY": "http://203.0.113.10:8080",
         }
-        with patch.dict(os.environ, proxy_env, clear=False):
+        with patch.dict(os.environ, proxy_env, clear=True):
             backend = TavilySearchBackend(
                 api_key="tvly-FAKE",
                 base_url="http://127.0.0.1:8765",
@@ -626,7 +626,7 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
             "HTTPS_PROXY": "http://203.0.113.10:8080",
             "ALL_PROXY": "http://203.0.113.10:8080",
         }
-        with patch.dict(os.environ, proxy_env, clear=False):
+        with patch.dict(os.environ, proxy_env, clear=True):
             backend = TavilySearchBackend(
                 api_key="tvly-FAKE",
                 base_url="https://api.tavily.com",
@@ -636,6 +636,39 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(getattr(client, "_trust_env", False))
             finally:
                 await backend.close()
+
+    async def test_client_init_error_is_sanitized(self):
+        fake_key = "tvly-FAKESECRET"
+        with patch(
+            "httpx.AsyncClient",
+            side_effect=httpx.InvalidURL("bad proxy config"),
+        ):
+            backend = TavilySearchBackend(
+                api_key=fake_key,
+                base_url="https://api.tavily.com",
+            )
+            with self.assertLogs("astrbot", level="WARNING") as logs:
+                result = await backend.search("游戏", 3, timeout_s=1)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "client_init_error")
+        self.assertNotIn(fake_key, str(result))
+        self.assertNotIn(fake_key, "\n".join(logs.output))
+
+    async def test_request_invalid_url_is_sanitized(self):
+        fake_key = "tvly-FAKESECRET"
+
+        async def handler(request):
+            raise httpx.InvalidURL("bad proxy config")
+
+        backend = self._backend(handler, api_key=fake_key)
+        with self.assertLogs("astrbot", level="WARNING") as logs:
+            result = await backend.search("游戏", 3, timeout_s=1)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "client_init_error")
+        self.assertNotIn(fake_key, str(result))
+        self.assertNotIn(fake_key, "\n".join(logs.output))
 
     async def test_http_error_does_not_leak_key(self):
         fake_key = "tvly-FAKESECRET"
@@ -729,6 +762,19 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<p>Two Snippet</p></li>'
         '</ol></body></html>'
     )
+    BING_ENTITIES = (
+        '<html><body><ol>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/entities">Entity &amp; Title</a></h2>'
+        '<p>Temperature &lt; 10 &gt; 5; '
+        '&amp;lt;literal&amp;gt; 中文 42 &amp; done</p></li>'
+        '<li>无关普通列表项</li>'
+        '<li class="b_algo"><h2>'
+        '<a href="https://example.com/more?a=1&amp;b=2">'
+        'Second &amp; More</a></h2>'
+        '<p>中文<span>与</span>数字 42 &lt; 10</p></li>'
+        '</ol></body></html>'
+    )
     BING_NO_SNIPPET = (
         '<html><body><ol>'
         '<li class="b_algo"><h2>'
@@ -740,12 +786,12 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '</ol></body></html>'
     )
 
-    def _service(self, handler, mode="web"):
+    def _service(self, handler, mode="web", timeout_ms=2000):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(client.aclose)
         svc = SearchService(
             mode=mode,
-            timeout_ms=2000,
+            timeout_ms=timeout_ms,
             result_count=3,
             web_client=client,
         )
@@ -895,6 +941,30 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("普通列表项", first["snippet"])
         self.assertNotIn("普通列表项", second["snippet"])
 
+    async def test_bing_entities_are_decoded_once_and_not_stripped(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_ENTITIES)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["results"]), 2)
+        first, second = result["results"]
+        self.assertEqual(first["title"], "Entity & Title")
+        self.assertEqual(
+            first["snippet"],
+            "Temperature < 10 > 5; &lt;literal&gt; 中文 42 & done",
+        )
+        self.assertEqual(second["title"], "Second & More")
+        self.assertEqual(
+            second["url"], "https://example.com/more?a=1&b=2"
+        )
+        self.assertEqual(second["snippet"], "中文与数字 42 < 10")
+        self.assertNotIn("无关普通列表项", first["snippet"])
+        self.assertNotIn("无关普通列表项", second["snippet"])
+
     async def test_bing_missing_snippet_does_not_take_neighbor_text(self):
         async def handler(request):
             if request.url.host == "www.bing.com":
@@ -922,6 +992,32 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             "Main Snippet after nested list",
             result["results"][0]["snippet"],
         )
+
+    async def test_fast_source_survives_slow_source_async_cleanup(self):
+        cleanup_done = []
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0.05)
+                cleanup_done.append("baidu")
+
+        svc = self._service(handler, timeout_ms=100)
+        start = time.monotonic()
+        result = await svc.search_game_info("游戏")
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["partial"])
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["partial_failures"][0]["source"], "baidu")
+        self.assertEqual(result["partial_failures"][0]["reason"], "timeout")
+        self.assertFalse(result["cleanup_incomplete"])
+        self.assertTrue(cleanup_done)
+        self.assertLess(elapsed, 0.15)
 
     async def test_bing_success_baidu_slow_is_partial(self):
         cancelled = []
@@ -1110,6 +1206,25 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(long_url, text)
         self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_total_budget_200_five_long_results_keep_headers_and_snippets(self):
+        results = [
+            item(
+                title=f"Five-{index}-" + "T" * 300,
+                url=f"https://example.com/{index}/" + "u" * 1000,
+                snippet=f"Snippet-{index}-" + "S" * 3000,
+                source=f"s{index}",
+            )
+            for index in range(5)
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        for index in range(5):
+            self.assertIn(f"Five-{index}", text)
+            self.assertIn(f"[s{index}]", text)
+            self.assertIn(f"Snippet-{index}", text)
+        self.assertNotIn("https://", text)
 
     def test_total_budget_200_three_long_results_keep_headers(self):
         results = [

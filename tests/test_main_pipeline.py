@@ -295,6 +295,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
             "status": "timeout",
             "reason": "timeout",
         }]
+        result["cleanup_incomplete"] = True
         plugin = make_plugin(result)
         plugin.show_generation_stats = True
         plugin.ai_client = FakeAIClient(summarize_text="AI" * 200)
@@ -305,6 +306,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(stats), 1)
         self.assertIn("搜索部分可用：是", stats[0])
         self.assertIn("部分失败来源：百度（超时）", stats[0])
+        self.assertIn("搜索清理：未完成", stats[0])
 
     async def test_generation_stats_show_backend_and_degraded(self):
         plugin = make_plugin(search_result(count=2))

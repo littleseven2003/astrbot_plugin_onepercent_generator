@@ -228,8 +228,16 @@ def build_search_summary(
     if available < count:
         return _truncate_text(items[0][1], total)
 
-    # 每条结果至少分到标题/来源预算；短标题节省下来的空间留给摘要。
-    header_share = max(1, available // count)
+    # 有摘要时为摘要预留约 30% 的总预算，避免五条长标题把摘要空间
+    # 全部吃掉；标题仍均分剩余预算，保证每条结果可识别。
+    has_snippets = any(item[2] for item in items)
+    snippet_reserve = 0
+    if has_snippets:
+        snippet_reserve = min(
+            available // 2, max(20, int(available * 0.3))
+        )
+    header_available = max(count, available - snippet_reserve)
+    header_share = max(1, header_available // count)
     headers = []
     for source, title, _snippet, _url in items:
         header = f"[{source}] {title}" if source else title
@@ -314,6 +322,7 @@ class BackendResult:
     duration_ms: int = 0
     partial: bool = False
     failures: list[dict] = field(default_factory=list)
+    cleanup_incomplete: bool = False
 
 
 class SearchBackend:
@@ -591,7 +600,11 @@ class TavilySearchBackend(SearchBackend):
             )
         if not self._base_url_allowed():
             return self._failure("failed", "insecure_api_base_url", start)
-        client = await self._get_client()
+        try:
+            client = await self._get_client()
+        except Exception:
+            # 系统代理等环境配置异常时，明确失败，不静默关闭 HTTPS 代理。
+            return self._failure("failed", "client_init_error", start)
         payload = {
             "query": query,
             "search_depth": "basic",
@@ -616,6 +629,8 @@ class TavilySearchBackend(SearchBackend):
             data = resp.json()
         except asyncio.CancelledError:
             raise
+        except httpx.InvalidURL:
+            return self._failure("failed", "client_init_error", start)
         except httpx.TimeoutException:
             return self._failure("timeout", "timeout", start)
         except httpx.HTTPStatusError as exc:
@@ -655,101 +670,143 @@ class TavilySearchBackend(SearchBackend):
             await self._client.aclose()
 
 
-class _BingBlockParser(HTMLParser):
-    """按标签深度提取完整的 b_algo 结果容器，支持嵌套 ul/li。"""
+class _BingResultParser(HTMLParser):
+    """单次解析 b_algo 容器：标题、URL、摘要一次收集。
+
+    HTMLParser(convert_charrefs=True) 只解码一次实体；收集的是文本 data，
+    不再重建 HTML 后二次解析，也不对其调用 _strip_html/unescape，避免
+    &lt; / &gt; / &amp;lt; 被删除或重复解码。摘要只接受结果容器顶层 <p>，
+    嵌套列表/普通 li/相邻结果不会混入。
+    """
 
     def __init__(self, container_tag: str):
         super().__init__(convert_charrefs=True)
         self.container_tag = container_tag
         self.depth = 0
-        self.capture_depth: int | None = None
-        self.buffer: list[str] = []
-        self.blocks: list[str] = []
+        self.result_depth: int | None = None
+        self.results: list[dict] = []
+        self._reset_result()
+
+    def _reset_result(self):
+        self.in_title = False
+        self.title_seen = False
+        self.title_parts: list[str] = []
+        self.url = ""
+        self.h2_depth = 0
+        self.list_depth = 0
+        self.in_snippet = False
+        self.snippet_parts: list[str] = []
+        self.snippet = ""
+        self.snippet_found = False
 
     @staticmethod
     def _is_result_start(attrs) -> bool:
         classes = dict(attrs).get("class") or ""
         return "b_algo" in classes.split()
 
+    def _finish_title(self):
+        if self.in_title and "".join(self.title_parts).strip():
+            self.title_seen = True
+        self.in_title = False
+
+    def _finish_snippet(self):
+        if not self.in_snippet:
+            return
+        text = "".join(self.snippet_parts).strip()
+        if text and not self.snippet_found:
+            self.snippet = text
+            self.snippet_found = True
+        self.in_snippet = False
+        self.snippet_parts = []
+
+    def _finish_result(self):
+        self._finish_title()
+        self._finish_snippet()
+        title = "".join(self.title_parts).strip()
+        if title:
+            self.results.append({
+                "title": title,
+                "url": self.url,
+                "snippet": self.snippet,
+            })
+
     def handle_starttag(self, tag, attrs):
-        raw = self.get_starttag_text() or f"<{tag}>"
         if tag == self.container_tag:
             self.depth += 1
-            if self.capture_depth is None and self._is_result_start(attrs):
-                self.capture_depth = self.depth
-                self.buffer = []
-            if self.capture_depth is not None:
-                self.buffer.append(raw)
+            if (
+                self.result_depth is None
+                and self._is_result_start(attrs)
+            ):
+                self.result_depth = self.depth
+                self._reset_result()
             return
-        if self.capture_depth is not None:
-            self.buffer.append(raw)
+
+        if self.result_depth is None:
+            return
+        if tag in ("ul", "ol"):
+            if self.in_snippet:
+                self._finish_snippet()
+            self.list_depth += 1
+            return
+        if tag == "h2":
+            self.h2_depth += 1
+            return
+        if tag == "br" and self.in_snippet:
+            self.snippet_parts.append(" ")
+            return
+        if tag == "a" and self.h2_depth > 0 and not self.in_title:
+            href = dict(attrs).get("href") or ""
+            self.in_title = True
+            self.title_parts = []
+            if href:
+                self.url = urljoin(
+                    "https://www.bing.com", str(href)
+                )
+            return
+        if (
+            tag == "p"
+            and self.title_seen
+            and self.list_depth == 0
+            and not self.in_snippet
+            and not self.snippet_found
+        ):
+            self.in_snippet = True
+            self.snippet_parts = []
 
     def handle_startendtag(self, tag, attrs):
-        raw = self.get_starttag_text() or f"<{tag}/>"
-        if self.capture_depth is not None:
-            self.buffer.append(raw)
+        if self.in_snippet and tag == "br":
+            self.snippet_parts.append(" ")
 
     def handle_endtag(self, tag):
         if tag == self.container_tag:
-            if self.capture_depth is not None:
-                self.buffer.append(f"</{tag}>")
             if (
-                self.capture_depth is not None
-                and self.depth == self.capture_depth
+                self.result_depth is not None
+                and self.depth == self.result_depth
             ):
-                self.blocks.append("".join(self.buffer))
-                self.capture_depth = None
-                self.buffer = []
+                self._finish_result()
+                self.result_depth = None
             self.depth = max(0, self.depth - 1)
             return
-        if self.capture_depth is not None:
-            self.buffer.append(f"</{tag}>")
 
-    def handle_data(self, data):
-        if self.capture_depth is not None:
-            self.buffer.append(data)
-
-    def handle_entityref(self, name):
-        if self.capture_depth is not None:
-            self.buffer.append(f"&{name};")
-
-    def handle_charref(self, name):
-        if self.capture_depth is not None:
-            self.buffer.append(f"&#{name};")
-
-
-class _BingSnippetParser(HTMLParser):
-    """只收集结果容器顶层的 <p>，跳过嵌套列表/普通 li 内文字。"""
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.list_depth = 0
-        self.parts: list[str] = []
-        self.in_paragraph = False
-        self.snippet = ""
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("ul", "ol"):
-            self.list_depth += 1
+        if self.result_depth is None:
             return
-        if tag == "p" and self.list_depth == 0 and not self.in_paragraph:
-            self.in_paragraph = True
-            self.parts = []
-
-    def handle_endtag(self, tag):
         if tag in ("ul", "ol"):
             self.list_depth = max(0, self.list_depth - 1)
             return
-        if tag == "p" and self.in_paragraph:
-            text = _strip_html("".join(self.parts))
-            if text and not self.snippet:
-                self.snippet = text
-            self.in_paragraph = False
-            self.parts = []
+        if tag == "a" and self.in_title:
+            self._finish_title()
+            return
+        if tag == "h2":
+            self.h2_depth = max(0, self.h2_depth - 1)
+            return
+        if tag == "p" and self.in_snippet:
+            self._finish_snippet()
 
     def handle_data(self, data):
-        if self.in_paragraph:
-            self.parts.append(data)
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_snippet:
+            self.snippet_parts.append(data)
 
 
 class WebSearchBackend(SearchBackend):
@@ -772,6 +829,7 @@ class WebSearchBackend(SearchBackend):
 
     def __init__(self, client: httpx.AsyncClient | None = None):
         self._client = client
+        self._cleanup_tasks: set[asyncio.Task] = set()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -792,6 +850,27 @@ class WebSearchBackend(SearchBackend):
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _source_deadlines(timeout_s: float | None) -> tuple[
+        float | None, float
+    ]:
+        """返回来源等待截止时间和取消后的有界清理预算。
+
+        来源截止时间提前于后端总预算，给被取消来源的 finally/异步清理
+        留出空间，避免外层总超时再次取消网页后端、丢掉已拿到的结果。
+        清理预算有上限；若清理仍超时，会记录 cleanup_incomplete 并
+        由 close() 继续收尾，属于明确报告的限制。
+        """
+        if timeout_s is None:
+            return None, 0.0
+        cleanup = min(0.06, max(0.005, timeout_s * 0.6))
+        margin = min(0.01, max(0.001, timeout_s * 0.05))
+        source = timeout_s - cleanup - margin
+        if source < 0.005:
+            source = max(0.001, timeout_s * 0.2)
+            cleanup = max(0.001, timeout_s - source - margin)
+        return max(0.001, source), max(0.001, cleanup)
 
     @classmethod
     def _is_verification_page(cls, html: str) -> bool:
@@ -823,13 +902,9 @@ class WebSearchBackend(SearchBackend):
     ) -> BackendResult:
         start = time.monotonic()
         client = await self._get_client()
-        # 给来源请求留出少量收尾余量，避免来源恰好在外层 total timeout
-        # 边界返回时，已经拿到的有效结果被外层取消。
-        source_timeout = timeout_s
-        if source_timeout is not None:
-            source_timeout = min(
-                source_timeout, max(0.01, source_timeout * 0.9)
-            )
+        # 来源截止提前于后端预算，给取消后的 finally/异步清理留空间；
+        # 清理预算有界，避免外层总超时再次取消整个网页后端。
+        source_timeout, cleanup_budget = self._source_deadlines(timeout_s)
         labeled_tasks = [
             ("bing", asyncio.create_task(
                 self._search_bing(client, query, max_results, source_timeout)
@@ -846,11 +921,29 @@ class WebSearchBackend(SearchBackend):
             await self._cancel_tasks(tasks)
             raise
 
+        cleanup_incomplete = False
         if pending:
-            for task in pending:
+            pending_list = list(pending)
+            for task in pending_list:
                 task.cancel()
             try:
-                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_list, return_exceptions=True),
+                    timeout=cleanup_budget,
+                )
+            except asyncio.TimeoutError:
+                cleanup_incomplete = True
+                self._cleanup_tasks.update(
+                    task for task in pending_list if not task.done()
+                )
+                logger.warning(
+                    "[小作文生成器] 网页来源取消清理超时: %s",
+                    ", ".join(labels[task] for task in pending_list),
+                )
+                for task in pending_list:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.sleep(0)
             except asyncio.CancelledError:
                 await self._cancel_tasks(tasks)
                 raise
@@ -902,6 +995,7 @@ class WebSearchBackend(SearchBackend):
                 duration_ms,
                 partial=bool(failures),
                 failures=failures,
+                cleanup_incomplete=cleanup_incomplete,
             )
 
         if failures:
@@ -928,9 +1022,15 @@ class WebSearchBackend(SearchBackend):
                 duration_ms,
                 partial=False,
                 failures=failures,
+                cleanup_incomplete=cleanup_incomplete,
             )
         return BackendResult(
-            self.name, "no_results", [], "empty_results", duration_ms
+            self.name,
+            "no_results",
+            [],
+            "empty_results",
+            duration_ms,
+            cleanup_incomplete=cleanup_incomplete,
         )
 
     async def _search_bing(self, client, query, max_results, timeout_s):
@@ -1001,47 +1101,29 @@ class WebSearchBackend(SearchBackend):
         return "http_error"
 
     @staticmethod
-    def _bing_blocks(html: str) -> list[str]:
+    def _parse_bing(html: str) -> list[dict]:
+        # 只解析 b_algo 容器；单次 HTMLParser 直接收集文本，避免实体
+        # 解码后重建 HTML 再解析导致的删除/重复解码。
+        results = []
         for container_tag in ("li", "div"):
-            parser = _BingBlockParser(container_tag)
+            parser = _BingResultParser(container_tag)
             try:
                 parser.feed(html)
                 parser.close()
             except Exception:
-                return parser.blocks
-            if parser.blocks:
-                return parser.blocks
-        return []
-
-    @staticmethod
-    def _bing_snippet(block: str) -> str:
-        parser = _BingSnippetParser()
-        try:
-            parser.feed(block)
-            parser.close()
-        except Exception:
-            return ""
-        return parser.snippet
-
-    @staticmethod
-    def _parse_bing(html: str) -> list[dict]:
-        # 只解析完整的 b_algo 容器；普通列表、广告和相邻结果不会进入
-        # 当前结果的摘要范围。容器内部嵌套 ul/li 由深度跟踪保留。
+                results = parser.results
+                break
+            if parser.results:
+                results = parser.results
+                break
         items = []
-        for block in WebSearchBackend._bing_blocks(html):
-            anchor = re.search(
-                r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                block,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if not anchor:
-                continue
-            url = urljoin("https://www.bing.com", html_lib.unescape(anchor.group(1)))
-            title = _strip_html(anchor.group(2))
-            snippet = WebSearchBackend._bing_snippet(block)
-            item = _normalize_item(
-                {"title": title, "url": url, "snippet": snippet, "source": "bing"}
-            )
+        for result in results:
+            item = _normalize_item({
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "source": "bing",
+            })
             if item:
                 items.append(item)
         return items
@@ -1079,6 +1161,10 @@ class WebSearchBackend(SearchBackend):
         return items
 
     async def close(self) -> None:
+        if self._cleanup_tasks:
+            pending = list(self._cleanup_tasks)
+            self._cleanup_tasks.clear()
+            await self._cancel_tasks(pending)
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
 
@@ -1189,6 +1275,7 @@ class SearchService:
             "degraded": False,
             "partial": False,
             "partial_failures": [],
+            "cleanup_incomplete": False,
             "effective_backend": "",
             "failure_reason": reason,
         }
@@ -1297,6 +1384,7 @@ class SearchService:
                 "result_count": len(result.results),
                 "partial": bool(result.partial),
                 "failures": list(result.failures),
+                "cleanup_incomplete": bool(result.cleanup_incomplete),
             })
 
             if result.status == "success" and result.results:
@@ -1315,6 +1403,7 @@ class SearchService:
                     "degraded": bool(skipped) or len(attempts) > 1 or partial,
                     "partial": partial,
                     "partial_failures": list(result.failures),
+                    "cleanup_incomplete": bool(result.cleanup_incomplete),
                     "effective_backend": name,
                     "failure_reason": "",
                 }
@@ -1344,6 +1433,9 @@ class SearchService:
             "degraded": bool(skipped) or len(attempts) > 1,
             "partial": False,
             "partial_failures": [],
+            "cleanup_incomplete": any(
+                item.get("cleanup_incomplete") for item in attempts
+            ),
             "effective_backend": "",
             "failure_reason": failure_reason,
         }
@@ -1363,6 +1455,7 @@ class SearchService:
             "skipped": result.get("skipped", []),
             "partial": result.get("partial", False),
             "partial_failures": result.get("partial_failures", []),
+            "cleanup_incomplete": result.get("cleanup_incomplete", False),
         }
 
     async def close(self) -> None:
@@ -1391,6 +1484,7 @@ _REASON_TEXT = {
     "astrbot_tool_disabled": "AstrBot 搜索工具已停用",
     "astrbot_retry_risk": "AstrBot 多 Key 自动重试风险",
     "insecure_api_base_url": "API 地址必须使用 HTTPS（回环地址除外）",
+    "client_init_error": "搜索客户端初始化失败",
     "verification_page": "验证页",
     "empty_results": "无有效结果",
     "no_results": "无有效结果",
@@ -1447,6 +1541,8 @@ def format_search_diagnostic(result: dict) -> str:
             )
             if failures_text:
                 message += f"；失败来源：{failures_text}"
+        if result.get("cleanup_incomplete"):
+            message += "；清理未完成"
         return message + "）"
 
     reason = _REASON_TEXT.get(
@@ -1468,6 +1564,8 @@ def format_search_diagnostic(result: dict) -> str:
     suffix = f"；尝试：{' → '.join(details)}" if details else ""
     if skipped_details:
         suffix += f"；跳过：{' → '.join(skipped_details)}"
+    if result.get("cleanup_incomplete"):
+        suffix += "；清理未完成"
     degraded = "是" if result.get("degraded") else "否"
     return (
         f"搜索失败（后端：无，有效结果：0，降级：{degraded}；"
