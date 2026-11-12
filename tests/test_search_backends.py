@@ -5,8 +5,10 @@ import asyncio
 import json
 import sys
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -43,6 +45,8 @@ class FakeBackend(SearchBackend):
         available=True,
         availability_reason="",
         on_search=None,
+        partial=False,
+        failures=None,
     ):
         self.name = name
         self.status = status
@@ -52,6 +56,8 @@ class FakeBackend(SearchBackend):
         self.available = available
         self.availability_reason = availability_reason
         self.on_search = on_search
+        self.partial = partial
+        self.failures = list(failures or [])
         self.calls = []
         self.cancelled = False
 
@@ -78,14 +84,25 @@ class FakeBackend(SearchBackend):
             self.results[:max_results],
             self.reason,
             int(self.delay * 1000),
+            partial=self.partial,
+            failures=self.failures,
         )
 
 
-def fake_service(backends, mode="auto", fallback_enabled=False, timeout_ms=2000):
+def fake_service(
+    backends,
+    mode="auto",
+    fallback_enabled=False,
+    timeout_ms=2000,
+    per_backend_timeout_ms=0,
+    summary_input_max_chars=6000,
+):
     return SearchService(
         mode=mode,
         fallback_enabled=fallback_enabled,
         timeout_ms=timeout_ms,
+        per_backend_timeout_ms=per_backend_timeout_ms,
+        summary_input_max_chars=summary_input_max_chars,
         backends=backends,
     )
 
@@ -275,6 +292,7 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             mode="api",
             fallback_enabled=True,
             timeout_ms=150,
+            per_backend_timeout_ms=100,
         )
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
@@ -283,6 +301,34 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual([a["status"] for a in result["attempted"]],
                          ["no_results", "timeout"])
+        self.assertLess(elapsed, 0.5)
+        await svc.close()
+
+    async def test_previous_timeout_leaves_time_for_next(self):
+        first = FakeBackend("api", results=[item()], delay=1.0)
+        second = FakeBackend("web", results=[item(source="bing")], delay=0.05)
+        svc = fake_service(
+            {"api": first, "web": second},
+            mode="api",
+            fallback_enabled=True,
+            timeout_ms=500,
+            per_backend_timeout_ms=100,
+        )
+        start = time.monotonic()
+        result = await svc.search_game_info("游戏")
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(
+            [a["backend"] for a in result["attempted"]],
+            ["api", "web"],
+        )
+        self.assertEqual(
+            [a["status"] for a in result["attempted"]],
+            ["timeout", "success"],
+        )
+        self.assertTrue(result["degraded"])
         self.assertLess(elapsed, 0.5)
         await svc.close()
 
@@ -322,32 +368,74 @@ class TimeoutAndCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.5)
         await svc.close()
 
+    async def test_availability_timeout_leaves_time_for_next(self):
+        class SlowAvailability(SearchBackend):
+            name = "api"
+
+            async def availability(self, event=None):
+                await asyncio.sleep(1)
+                return True, ""
+
+            async def search(self, query, max_results, event=None, timeout_s=None):
+                return BackendResult("api", "success", [item()], "", 0)
+
+        web = FakeBackend("web", results=[item(source="bing")], delay=0.01)
+        svc = fake_service(
+            {"api": SlowAvailability(), "web": web},
+            mode="api",
+            fallback_enabled=True,
+            timeout_ms=500,
+            per_backend_timeout_ms=100,
+        )
+        start = time.monotonic()
+        result = await svc.search_game_info("游戏")
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(result["skipped"][0]["backend"], "api")
+        self.assertEqual(
+            result["skipped"][0]["reason"], "budget_exhausted"
+        )
+        self.assertLess(elapsed, 0.5)
+        await svc.close()
+
     async def test_outer_cancellation_propagates(self):
         started = asyncio.Event()
+        backend = FakeBackend("web")
 
         async def on_search(query, max_results, event, timeout_s):
             started.set()
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
+                backend.cancelled = True
                 raise
             return BackendResult("web", "success", [item()], "", 0)
 
-        backend = FakeBackend("web", on_search=on_search)
+        backend.on_search = on_search
         svc = fake_service({"web": backend}, mode="web", timeout_ms=5000)
         task = asyncio.create_task(svc.search_game_info("游戏"))
         await asyncio.wait_for(started.wait(), timeout=1)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        self.assertTrue(backend.cancelled)
         await svc.close()
 
 
 class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
-    def _backend(self, handler, api_key="tvly-TEST-ONLY"):
+    def _backend(
+        self,
+        handler,
+        api_key="tvly-TEST-ONLY",
+        base_url="https://api.tavily.com",
+    ):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(client.aclose)
-        return TavilySearchBackend(api_key=api_key, client=client)
+        return TavilySearchBackend(
+            api_key=api_key, base_url=base_url, client=client
+        )
 
     async def test_success_request_contract(self):
         captured = {}
@@ -389,6 +477,46 @@ class TavilyBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(available)
         self.assertEqual(reason, "missing_api_key")
         self.assertEqual(calls["n"], 0)
+
+    async def test_non_loopback_http_api_key_rejected(self):
+        calls = {"n": 0}
+
+        async def handler(request):
+            calls["n"] += 1
+            return httpx.Response(200, json={"results": []})
+
+        backend = self._backend(
+            handler, base_url="http://example.com"
+        )
+        available, reason = await backend.availability()
+        self.assertFalse(available)
+        self.assertEqual(reason, "insecure_api_base_url")
+        result = await backend.search("游戏", 3, timeout_s=2)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "insecure_api_base_url")
+        self.assertEqual(calls["n"], 0)
+
+    async def test_loopback_http_api_key_allowed_for_local_mock(self):
+        captured = {}
+
+        async def handler(request):
+            captured["host"] = request.url.host
+            return httpx.Response(200, json={
+                "results": [{
+                    "title": "Local",
+                    "url": "https://example.com/local",
+                    "content": "Local Snippet",
+                }]
+            })
+
+        backend = self._backend(
+            handler, base_url="http://127.0.0.1:8765"
+        )
+        available, reason = await backend.availability()
+        self.assertTrue(available, reason)
+        result = await backend.search("游戏", 3, timeout_s=2)
+        self.assertEqual(result.status, "success")
+        self.assertEqual(captured["host"], "127.0.0.1")
 
     async def test_http_error_does_not_leak_key(self):
         fake_key = "tvly-FAKESECRET"
@@ -462,6 +590,14 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Baidu Snippet</div>'
         '</body></html>'
     )
+    BING_NESTED = (
+        '<html><body><ol>'
+        '<li class="b_algo"><h2><a href="https://example.com/nested">'
+        'Nested Title</a></h2>'
+        '<ul><li>nested child</li></ul>'
+        '<p>Main Snippet after nested list</p></li>'
+        '</ol></body></html>'
+    )
 
     def _service(self, handler, mode="web"):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -529,6 +665,84 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(len(result["results"]), 1)
         self.assertEqual(result["results"][0]["source"], "bing")
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["partial_failures"][0]["source"], "baidu")
+        self.assertEqual(
+            result["partial_failures"][0]["reason"], "verification_page"
+        )
+
+    async def test_bing_ok_baidu_timeout_is_partial(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            await asyncio.sleep(0.02)
+            raise httpx.TimeoutException("timeout", request=request)
+
+        svc = self._service(handler)
+        result = await svc.search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["degraded"])
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["partial_failures"], [{
+            "source": "baidu",
+            "status": "timeout",
+            "reason": "timeout",
+        }])
+        diag = await svc.test_search("游戏")
+        self.assertIn("部分可用：是", diag["message"])
+        self.assertIn("百度", diag["message"])
+        self.assertIn("超时", diag["message"])
+
+    async def test_bing_ok_baidu_429_is_partial(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_OK)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["partial"])
+        self.assertEqual(
+            result["partial_failures"][0]["reason"], "http_429"
+        )
+        self.assertEqual(result["partial_failures"][0]["source"], "baidu")
+
+    async def test_normal_result_with_verification_word_is_success(self):
+        page = (
+            '<html><body><ol><li class="b_algo">'
+            '<h2><a href="https://example.com/normal">验证码攻略</a></h2>'
+            '<p>正常搜索结果摘要，提到验证码但不影响阅读</p>'
+            '</li></ol></body></html>'
+        )
+
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=page)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["results"][0]["title"], "验证码攻略")
+        self.assertNotEqual(result["failure_reason"], "verification_page")
+
+    async def test_bing_nested_list_keeps_snippet_after_nested_li(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_NESTED)
+            return httpx.Response(429, text="rate limited")
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["results"][0]["title"], "Nested Title")
+        self.assertIn(
+            "Main Snippet after nested list",
+            result["results"][0]["snippet"],
+        )
 
     async def test_web_backend_direct(self):
         async def handler(request):
@@ -565,6 +779,64 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[tavily] 标题", text)
         self.assertIn("摘要", text)
         self.assertIn("https://example.com/a", text)
+
+    def test_long_snippet_does_not_crowd_out_later_items(self):
+        text = build_search_summary([
+            item(title="First", snippet="长" * 10000),
+            item(title="Second", snippet="后面的有效摘要"),
+        ], max_total_chars=400)
+
+        self.assertLessEqual(len(text), 400)
+        self.assertIn("First", text)
+        self.assertIn("Second", text)
+        self.assertIn("后面的有效摘要", text)
+        self.assertNotIn("长" * 1000, text)
+
+    def test_long_url_is_rejected_without_crowding_output(self):
+        text = build_search_summary([
+            item(title="Long", url="https://example.com/" + "a" * 4000),
+            item(title="OK", url="https://example.com/ok"),
+        ], max_total_chars=400)
+
+        self.assertNotIn("Long", text)
+        self.assertIn("OK", text)
+        self.assertLessEqual(len(text), 400)
+
+    async def test_search_service_summary_input_budget(self):
+        backend = FakeBackend("web", results=[
+            item(title="A", snippet="x" * 3000),
+            item(title="B", snippet="y" * 3000),
+        ])
+        svc = fake_service(
+            {"web": backend}, mode="web", summary_input_max_chars=300
+        )
+        result = await svc.search_game_info("游戏")
+
+        self.assertEqual(result["status"], "success")
+        self.assertLessEqual(len(result["summary"]), 300)
+        self.assertIn("A", result["summary"])
+        self.assertIn("B", result["summary"])
+        await svc.close()
+
+    async def test_admin_diagnostic_marks_partial_source(self):
+        backend = FakeBackend(
+            "web",
+            results=[item(source="bing")],
+            partial=True,
+            failures=[{
+                "source": "baidu",
+                "status": "timeout",
+                "reason": "timeout",
+            }],
+        )
+        svc = fake_service({"web": backend}, mode="web")
+        diag = await svc.test_search("游戏")
+
+        self.assertTrue(diag["success"])
+        self.assertTrue(diag["partial"])
+        self.assertIn("部分可用：是", diag["message"])
+        self.assertIn("百度（超时）", diag["message"])
+        await svc.close()
 
     def test_prompt_receives_budgeted_digest(self):
         raw = "长" * 500
@@ -636,7 +908,174 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("有效结果：0", message)
 
 
+class FakeManagedTool:
+    def __init__(self, active=True):
+        self.active = active
+        self.calls = []
+
+    async def call(self, context, **kwargs):
+        self.calls.append(kwargs)
+        return json.dumps({
+            "results": [{
+                "title": "Managed",
+                "url": "https://example.com/managed",
+                "snippet": "Managed Snippet",
+            }]
+        })
+
+
+class FakeToolManager:
+    def __init__(self, registered=True, tool=None):
+        self.registered = registered
+        self.tool = tool or FakeManagedTool()
+        self.requested = []
+
+    def is_builtin_tool(self, name):
+        return self.registered
+
+    def get_builtin_tool(self, name):
+        self.requested.append(name)
+        if not self.registered:
+            raise KeyError(name)
+        return self.tool
+
+
+class ManagedContext:
+    def __init__(self, cfg, manager):
+        self.cfg = cfg
+        self.manager = manager
+
+    def get_config(self, umo=None):
+        return self.cfg
+
+    def get_llm_tool_manager(self):
+        return self.manager
+
+
+class ManagedEvent:
+    unified_msg_origin = "webchat:managed-test"
+
+
 class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _fake_astrbot_modules():
+        astrbot = types.ModuleType("astrbot")
+        astrbot.__version__ = "4.29.4"
+        core = types.ModuleType("astrbot.core")
+        agent = types.ModuleType("astrbot.core.agent")
+        run_context = types.ModuleType("astrbot.core.agent.run_context")
+
+        class FakeWrapper:
+            def __init__(self, context):
+                self.context = context
+
+        class FakeAgentContext:
+            def __init__(self, context=None, event=None):
+                self.context = context
+                self.event = event
+
+        run_context.ContextWrapper = FakeWrapper
+        astr_agent_context = types.ModuleType(
+            "astrbot.core.astr_agent_context"
+        )
+        astr_agent_context.AstrAgentContext = FakeAgentContext
+        return patch.dict(sys.modules, {
+            "astrbot": astrbot,
+            "astrbot.core": core,
+            "astrbot.core.agent": agent,
+            "astrbot.core.agent.run_context": run_context,
+            "astrbot.core.astr_agent_context": astr_agent_context,
+        })
+
+    @staticmethod
+    def _cfg(**overrides):
+        settings = {
+            "web_search": True,
+            "websearch_provider": "tavily",
+            "websearch_tavily_key": ["tvly-FAKE"],
+        }
+        settings.update(overrides)
+        return {"provider_settings": settings}
+
+    async def test_managed_tool_unregistered_is_unavailable(self):
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(registered=False)
+        )
+        with self._fake_astrbot_modules():
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertFalse(available)
+        self.assertEqual(reason, "astrbot_tool_unregistered")
+
+    async def test_managed_tool_disabled_is_unavailable(self):
+        tool = FakeManagedTool(active=False)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules():
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+            result = await backend.search(
+                "游戏", 3, event=ManagedEvent(), timeout_s=1
+            )
+
+        self.assertFalse(available)
+        self.assertEqual(reason, "astrbot_tool_disabled")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "astrbot_search_error")
+        self.assertEqual(len(tool.calls), 0)
+
+    async def test_managed_tool_enabled_is_available(self):
+        tool = FakeManagedTool(active=True)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules():
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertTrue(available, reason)
+        self.assertEqual(reason, "")
+
+    async def test_search_uses_managed_tool_instance(self):
+        tool = FakeManagedTool(active=True)
+        manager = FakeToolManager(tool=tool)
+        context = ManagedContext(self._cfg(), manager)
+        with self._fake_astrbot_modules():
+            backend = AstrBotSearchBackend(context=context)
+            result = await backend.search(
+                "游戏", 3, event=ManagedEvent(), timeout_s=1
+            )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.results[0]["source"], "astrbot")
+        self.assertEqual(manager.requested, ["web_search_tavily"])
+        self.assertEqual(len(tool.calls), 1)
+        self.assertEqual(tool.calls[0]["max_results"], 5)
+
+    async def test_config_profile_mismatch_is_unavailable(self):
+        cases = [
+            (self._cfg(web_search=False), "astrbot_search_disabled"),
+            (self._cfg(websearch_provider="serpapi"),
+             "astrbot_provider_unverified"),
+            (self._cfg(websearch_tavily_key=[]), "astrbot_key_missing"),
+            (self._cfg(websearch_tavily_key=[""]), "astrbot_key_missing"),
+            (self._cfg(websearch_tavily_key=["k1", "k2"]),
+             "astrbot_retry_risk"),
+        ]
+        with self._fake_astrbot_modules():
+            for cfg, expected in cases:
+                with self.subTest(reason=expected):
+                    backend = AstrBotSearchBackend(
+                        context=ManagedContext(cfg, FakeToolManager())
+                    )
+                    available, reason = await backend.availability(
+                        ManagedEvent()
+                    )
+                    self.assertFalse(available)
+                    self.assertEqual(reason, expected)
+
     async def test_injected_adapter_returns_structured_results(self):
         async def adapter(query, max_results, event):
             return json.dumps({

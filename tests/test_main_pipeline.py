@@ -178,6 +178,7 @@ def make_plugin(search_result=None, diagnostic=None):
             "result_count": 3,
             "summarize_enabled": True,
             "summarize_max_chars": 40,
+            "summary_input_max_chars": 6000,
         },
         "rate_limit": {
             "window_minutes": 10,
@@ -219,6 +220,8 @@ def search_result(summary="RAW" * 200, count=2):
             "result_count": count,
         }],
         "degraded": True,
+        "partial": False,
+        "partial_failures": [],
         "effective_backend": "api",
         "failure_reason": "",
     }
@@ -270,6 +273,38 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_ai.summarize_calls), 0)
         self.assertIn(("RAW" * 200)[:40], fake_ai.prompts[0])
         self.assertNotIn("SHOULD-NOT-BE-USED", fake_ai.prompts[0])
+
+    async def test_summary_input_capped_before_ai_summarize(self):
+        plugin = make_plugin(search_result(summary="R" * 2000))
+        plugin.search_summary_input_max_chars = 120
+        fake_ai = FakeAIClient(summarize_text="AI" * 200)
+        plugin.ai_client = fake_ai
+
+        await self._run(plugin)
+
+        self.assertEqual(len(fake_ai.summarize_calls), 1)
+        self.assertLessEqual(
+            len(fake_ai.summarize_calls[0]["raw_text"]), 120
+        )
+
+    async def test_generation_stats_show_partial_source(self):
+        result = search_result(count=1)
+        result["partial"] = True
+        result["partial_failures"] = [{
+            "source": "baidu",
+            "status": "timeout",
+            "reason": "timeout",
+        }]
+        plugin = make_plugin(result)
+        plugin.show_generation_stats = True
+        plugin.ai_client = FakeAIClient(summarize_text="AI" * 200)
+
+        _, messages = await self._run(plugin)
+
+        stats = [m["text"] for m in messages if "本次生成信息" in m["text"]]
+        self.assertEqual(len(stats), 1)
+        self.assertIn("搜索部分可用：是", stats[0])
+        self.assertIn("部分失败来源：百度（超时）", stats[0])
 
     async def test_generation_stats_show_backend_and_degraded(self):
         plugin = make_plugin(search_result(count=2))

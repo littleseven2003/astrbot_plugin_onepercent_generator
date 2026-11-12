@@ -16,6 +16,7 @@ from .rate_limiter import RateLimiter
 from .search_service import (
     BACKEND_LABELS,
     SearchService,
+    format_source_failures,
     prepare_search_digest,
 )
 from .whitelist import is_session_allowed
@@ -48,6 +49,12 @@ class OnePercentGenerator(Star):
         self.search_service = SearchService(
             enabled=search_cfg.get("enabled", True),
             timeout_ms=search_cfg.get("timeout_ms", 8000),
+            per_backend_timeout_ms=search_cfg.get(
+                "per_backend_timeout_ms", 0
+            ),
+            summary_input_max_chars=search_cfg.get(
+                "summary_input_max_chars", 6000
+            ),
             result_count=search_cfg.get("result_count", 3),
             mode=search_cfg.get("mode"),
             fallback_enabled=search_cfg.get("fallback_enabled", False),
@@ -60,6 +67,12 @@ class OnePercentGenerator(Star):
         )
         self.search_summarize_enabled = search_cfg.get("summarize_enabled", True)
         self.search_summarize_max_chars = search_cfg.get("summarize_max_chars", 150)
+        try:
+            self.search_summary_input_max_chars = max(
+                200, int(search_cfg.get("summary_input_max_chars", 6000))
+            )
+        except (TypeError, ValueError):
+            self.search_summary_input_max_chars = 6000
 
         # 频率限制配置
         rate_cfg = self.config.get("rate_limit", {})
@@ -178,7 +191,11 @@ class OnePercentGenerator(Star):
         search_result = await self.search_service.search_game_info(
             game_name, event=event
         )
-        raw_summary = search_result.get("summary", "")
+        raw_summary = prepare_search_digest(
+            search_result.get("summary", ""),
+            "",
+            self.search_summary_input_max_chars,
+        )
         logger.info(
             "[小作文生成器] 搜索状态: %s, 后端: %s, 有效结果: %s, 游戏: %s",
             search_result.get("status"),
@@ -242,6 +259,10 @@ class OnePercentGenerator(Star):
             search_degraded = "是" if search_result.get("degraded") else "否"
             search_valid_count = len(search_result.get("results", []))
             search_failure_reason = search_result.get("failure_reason", "")
+            search_partial = "是" if search_result.get("partial") else "否"
+            search_partial_failures = format_source_failures(
+                search_result.get("partial_failures", [])
+            )
 
             # 用户使用情况
             usage = await self.rate_limiter.get_usage_status(sender_id, self)
@@ -262,6 +283,12 @@ class OnePercentGenerator(Star):
                 f"搜索后端：{search_backend_label}",
                 f"搜索降级：{search_degraded}",
                 f"有效结果：{search_valid_count}",
+                f"搜索部分可用：{search_partial}",
+                *(
+                    [f"部分失败来源：{search_partial_failures}"]
+                    if search_partial_failures
+                    else []
+                ),
                 f"搜索汇总：{search_digest if search_digest else '无'}",
                 *(
                     [f"搜索失败原因：{search_failure_reason}"]

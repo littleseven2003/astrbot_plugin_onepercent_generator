@@ -12,6 +12,7 @@
 
 import asyncio
 import html as html_lib
+import ipaddress
 import json
 import logging
 import random
@@ -35,9 +36,20 @@ USER_AGENTS = [
 
 MODES = ("auto", "astrbot", "api", "web", "off")
 BACKEND_ORDER = ("astrbot", "api", "web")
+MAX_TITLE_CHARS = 300
+MAX_URL_CHARS = 2048
+MAX_SNIPPET_CHARS = 1000
+DEFAULT_SUMMARY_INPUT_MAX_CHARS = 6000
 BACKEND_LABELS = {
     "astrbot": "AstrBot",
     "api": "Tavily API",
+    "web": "网页搜索",
+}
+SOURCE_LABELS = {
+    "bing": "必应",
+    "baidu": "百度",
+    "tavily": "Tavily",
+    "astrbot": "AstrBot",
     "web": "网页搜索",
 }
 # 只对已在源码层核实调用契约的 AstrBot 版本启用内部适配。
@@ -130,6 +142,18 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[:limit]
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    host = host.strip().lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _is_http_url(url: str) -> bool:
     try:
         parsed = urlparse((url or "").strip())
@@ -142,11 +166,14 @@ def _normalize_item(raw: dict, default_source: str = "") -> dict | None:
     """只保留有标题和 http(s) URL 的条目；缺失字段留空，不编造。"""
     if not isinstance(raw, dict):
         return None
-    title = str(raw.get("title") or "").strip()
+    title = _truncate_text(str(raw.get("title") or ""), MAX_TITLE_CHARS)
     url = str(raw.get("url") or "").strip()
-    snippet = str(raw.get("snippet") or raw.get("content") or "").strip()
-    source = str(raw.get("source") or default_source or "").strip()
-    if not title or not _is_http_url(url):
+    snippet = _truncate_text(
+        str(raw.get("snippet") or raw.get("content") or ""),
+        MAX_SNIPPET_CHARS,
+    )
+    source = str(raw.get("source") or default_source or "").strip()[:64]
+    if not title or len(url) > MAX_URL_CHARS or not _is_http_url(url):
         return None
     return {
         "title": title,
@@ -156,23 +183,42 @@ def _normalize_item(raw: dict, default_source: str = "") -> dict | None:
     }
 
 
-def build_search_summary(results: list[dict]) -> str:
-    """把统一结果拼成供 AI 汇总/生成参考的文本。"""
-    lines = []
+def build_search_summary(
+    results: list[dict],
+    max_total_chars: int = DEFAULT_SUMMARY_INPUT_MAX_CHARS,
+) -> str:
+    """把统一结果拼成供 AI 汇总/生成参考的文本。
+
+    单条标题/摘要先截断，再按条目数均分总量预算，避免第一条超长结果
+    挤掉后续有效条目；最后再执行总预算硬截断。
+    """
+    items = []
     for item in results:
-        title = str(item.get("title") or "").strip()
+        title = _truncate_text(str(item.get("title") or ""), MAX_TITLE_CHARS)
         if not title:
             continue
-        source = str(item.get("source") or "").strip()
-        snippet = str(item.get("snippet") or "").strip()
         url = str(item.get("url") or "").strip()
+        if len(url) > MAX_URL_CHARS or not _is_http_url(url):
+            continue
+        snippet = _truncate_text(
+            str(item.get("snippet") or ""), MAX_SNIPPET_CHARS
+        )
+        source = str(item.get("source") or "").strip()[:64]
+        items.append((source, title, snippet, url))
+
+    if not items:
+        return ""
+
+    per_item_budget = max(200, int(max_total_chars) // len(items))
+    blocks = []
+    for source, title, snippet, url in items:
         block = f"[{source}] {title}" if source else title
         if snippet:
             block += f"\n{snippet}"
         if url:
             block += f"\n{url}"
-        lines.append(block)
-    return "\n\n".join(lines)
+        blocks.append(_truncate_text(block, per_item_budget))
+    return _truncate_text("\n\n".join(blocks), max_total_chars)
 
 
 def prepare_search_digest(
@@ -216,6 +262,8 @@ class BackendResult:
     results: list[dict] = field(default_factory=list)
     reason: str = ""
     duration_ms: int = 0
+    partial: bool = False
+    failures: list[dict] = field(default_factory=list)
 
 
 class SearchBackend:
@@ -243,11 +291,16 @@ class AstrBotSearchBackend(SearchBackend):
     """AstrBot 内置 web_search_tavily 适配器。
 
     契约来自 AstrBot 4.29.4 源码：
-    astrbot.core.tools.web_search_tools.TavilyWebSearchTool.call(
+    Context.get_llm_tool_manager() -> FunctionToolManager
+    manager.is_builtin_tool("web_search_tavily")
+    manager.get_builtin_tool("web_search_tavily").call(
         ContextWrapper[AstrAgentContext], query=..., max_results=...
     )
-    该接口不是公开插件 API，因此只对已验证版本启用，并检查当前会话
-    provider_settings 的 web_search/provider/key。任何一项不满足即不可用。
+
+    只有工具已注册、active=True 且当前会话 provider_settings 允许时才可用；
+    不直接实例化工具类，避免绕过停用状态。AstrBot 的 Tavily 实现会在多个
+    Key 之间对 401/403/429/432 做故障转移重试，因此本项目仅在恰好一个
+    Tavily Key 时启用该后端，避免自动重复计费请求。
     """
 
     name = "astrbot"
@@ -277,9 +330,27 @@ class AstrBotSearchBackend(SearchBackend):
         try:
             from astrbot.core.agent.run_context import ContextWrapper  # noqa: F401
             from astrbot.core.astr_agent_context import AstrAgentContext  # noqa: F401
-            from astrbot.core.tools.web_search_tools import TavilyWebSearchTool  # noqa: F401
         except Exception:
             return False, "astrbot_contract_unavailable"
+
+        try:
+            tool_mgr = self._context.get_llm_tool_manager()
+        except Exception:
+            return False, "astrbot_tool_manager_unavailable"
+        try:
+            registered = bool(tool_mgr.is_builtin_tool("web_search_tavily"))
+        except Exception:
+            return False, "astrbot_tool_manager_unavailable"
+        if not registered:
+            return False, "astrbot_tool_unregistered"
+        try:
+            tool = tool_mgr.get_builtin_tool("web_search_tavily")
+        except Exception:
+            return False, "astrbot_tool_unregistered"
+        if tool is None:
+            return False, "astrbot_tool_unregistered"
+        if not bool(getattr(tool, "active", True)):
+            return False, "astrbot_tool_disabled"
 
         try:
             cfg = self._context.get_config(umo=umo)
@@ -295,7 +366,14 @@ class AstrBotSearchBackend(SearchBackend):
         keys = provider_settings.get("websearch_tavily_key") or []
         if isinstance(keys, str):
             keys = [keys] if keys else []
+        else:
+            keys = list(keys)
         if not keys:
+            return False, "astrbot_key_missing"
+        if len(keys) > 1:
+            # AstrBot 内置实现会按 Key 轮换重试可重试状态码。
+            return False, "astrbot_retry_risk"
+        if not isinstance(keys[0], str) or not keys[0].strip():
             return False, "astrbot_key_missing"
         return True, ""
 
@@ -354,15 +432,25 @@ class AstrBotSearchBackend(SearchBackend):
             return BackendResult(self.name, "no_results", [], "empty_results", duration_ms)
         return BackendResult(self.name, "success", results, "", duration_ms)
 
+    def _managed_tool(self):
+        tool_mgr = self._context.get_llm_tool_manager()
+        if not tool_mgr.is_builtin_tool("web_search_tavily"):
+            raise RuntimeError("web_search_tavily is not registered")
+        tool = tool_mgr.get_builtin_tool("web_search_tavily")
+        if tool is None:
+            raise RuntimeError("web_search_tavily is unavailable")
+        if not bool(getattr(tool, "active", True)):
+            raise RuntimeError("web_search_tavily is disabled")
+        return tool
+
     async def _call_builtin(self, query: str, max_results: int, event):
         from astrbot.core.agent.run_context import ContextWrapper
         from astrbot.core.astr_agent_context import AstrAgentContext
-        from astrbot.core.tools.web_search_tools import TavilyWebSearchTool
 
         wrapper = ContextWrapper(
             AstrAgentContext(context=self._context, event=event)
         )
-        tool = TavilyWebSearchTool()
+        tool = self._managed_tool()
         # AstrBot 内置工具声明 max_results 范围为 5-20，按契约取安全值；
         # 解析后再按调用方 result_count 截断。
         tool_max_results = max(5, min(int(max_results), 20))
@@ -390,6 +478,15 @@ class TavilySearchBackend(SearchBackend):
         self._provider = (provider or "tavily").strip().lower()
         self._client = client
 
+    def _base_url_allowed(self) -> bool:
+        """携带 Key 时默认必须 HTTPS；仅允许回环 HTTP 供本地模拟。"""
+        parsed = urlparse(self._base_url)
+        if parsed.scheme == "https":
+            return bool(parsed.netloc)
+        if parsed.scheme == "http":
+            return _is_loopback_host(parsed.hostname)
+        return False
+
     async def availability(self, event=None) -> tuple[bool, str]:
         if self._provider != "tavily":
             return False, "api_provider_unverified"
@@ -397,6 +494,8 @@ class TavilySearchBackend(SearchBackend):
             return False, "missing_api_key"
         if not _is_http_url(self._base_url):
             return False, "invalid_base_url"
+        if not self._base_url_allowed():
+            return False, "insecure_api_base_url"
         return True, ""
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -425,6 +524,8 @@ class TavilySearchBackend(SearchBackend):
             return BackendResult(
                 self.name, "unavailable", [], "missing_api_key", 0
             )
+        if not self._base_url_allowed():
+            return self._failure("failed", "insecure_api_base_url", start)
         client = await self._get_client()
         payload = {
             "query": query,
@@ -524,8 +625,21 @@ class WebSearchBackend(SearchBackend):
 
     @classmethod
     def _is_verification_page(cls, html: str) -> bool:
+        # 仅在“没有解析出任何有效结果”时调用。正常结果页即使摘要里出现
+        # “验证码”等词，也已在解析阶段直接按结果页处理，不会走到这里。
         text = _extract_text_from_html(html)
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>", html, re.DOTALL | re.IGNORECASE
+        )
+        title = _strip_html(title_match.group(1)).lower() if title_match else ""
+        if title and any(
+            keyword.lower() in title for keyword in cls.VERIFICATION_KEYWORDS
+        ):
+            return True
         if not text:
+            return False
+        # 大页面里的“验证码”更可能来自正常摘要或页脚，避免整页误判。
+        if len(text) > 1200:
             return False
         low = text.lower()
         return any(keyword.lower() in low for keyword in cls.VERIFICATION_KEYWORDS)
@@ -539,12 +653,19 @@ class WebSearchBackend(SearchBackend):
     ) -> BackendResult:
         start = time.monotonic()
         client = await self._get_client()
+        # 给来源请求留出少量收尾余量，避免来源恰好在外层 total timeout
+        # 边界返回时，已经拿到的有效结果被外层取消。
+        source_timeout = timeout_s
+        if source_timeout is not None:
+            source_timeout = min(
+                source_timeout, max(0.01, source_timeout * 0.9)
+            )
         tasks = [
             asyncio.create_task(
-                self._search_bing(client, query, max_results, timeout_s)
+                self._search_bing(client, query, max_results, source_timeout)
             ),
             asyncio.create_task(
-                self._search_baidu(client, query, max_results, timeout_s)
+                self._search_baidu(client, query, max_results, source_timeout)
             ),
         ]
         try:
@@ -556,7 +677,7 @@ class WebSearchBackend(SearchBackend):
 
         merged: list[dict] = []
         seen: set[str] = set()
-        failures: list[str] = []
+        failures: list[dict] = []
         for label, status, items, reason in source_results:
             if status == "success":
                 for item in items:
@@ -565,23 +686,57 @@ class WebSearchBackend(SearchBackend):
                         continue
                     seen.add(key)
                     merged.append(item)
-            elif reason:
-                failures.append(f"{label}:{reason}")
+            else:
+                failures.append({
+                    "source": label,
+                    "status": status,
+                    "reason": reason or status,
+                })
         merged = merged[:max_results]
         duration_ms = int((time.monotonic() - start) * 1000)
 
         if merged:
-            reason = "; ".join(failures)
-            return BackendResult(self.name, "success", merged, reason, duration_ms)
+            reason = "; ".join(
+                f"{item['source']}:{item['reason']}" for item in failures
+            )
+            return BackendResult(
+                self.name,
+                "success",
+                merged,
+                reason,
+                duration_ms,
+                partial=bool(failures),
+                failures=failures,
+            )
 
         if failures:
-            reason = failures[0].split(":", 1)[1]
-            if any("verification_page" in item for item in failures):
+            reason = failures[0]["reason"] or "failed"
+            if any(item["reason"] == "verification_page" for item in failures):
                 reason = "verification_page"
-            elif all("empty_results" in item or "no_results" in item for item in failures):
-                reason = "empty_results"
-            return BackendResult(self.name, "failed", [], reason, duration_ms)
-        return BackendResult(self.name, "no_results", [], "empty_results", duration_ms)
+            else:
+                meaningful = [
+                    item["reason"] for item in failures
+                    if item["reason"] not in ("empty_results", "no_results")
+                ]
+                if meaningful:
+                    reason = meaningful[0]
+                elif all(
+                    item["reason"] in ("empty_results", "no_results")
+                    for item in failures
+                ):
+                    reason = "empty_results"
+            return BackendResult(
+                self.name,
+                "failed",
+                [],
+                reason,
+                duration_ms,
+                partial=False,
+                failures=failures,
+            )
+        return BackendResult(
+            self.name, "no_results", [], "empty_results", duration_ms
+        )
 
     async def _search_bing(self, client, query, max_results, timeout_s):
         try:
@@ -604,12 +759,12 @@ class WebSearchBackend(SearchBackend):
         except Exception:
             return ("bing", "failed", [], "backend_error")
 
+        items = self._parse_bing(html)[:max_results]
+        if items:
+            return ("bing", "success", items, "")
         if self._is_verification_page(html):
             return ("bing", "failed", [], "verification_page")
-        items = self._parse_bing(html)[:max_results]
-        if not items:
-            return ("bing", "no_results", [], "empty_results")
-        return ("bing", "success", items, "")
+        return ("bing", "no_results", [], "empty_results")
 
     async def _search_baidu(self, client, query, max_results, timeout_s):
         try:
@@ -634,12 +789,12 @@ class WebSearchBackend(SearchBackend):
         except Exception:
             return ("baidu", "failed", [], "backend_error")
 
+        items = self._parse_baidu(html)[:max_results]
+        if items:
+            return ("baidu", "success", items, "")
         if self._is_verification_page(html):
             return ("baidu", "failed", [], "verification_page")
-        items = self._parse_baidu(html)[:max_results]
-        if not items:
-            return ("baidu", "no_results", [], "empty_results")
-        return ("baidu", "success", items, "")
+        return ("baidu", "no_results", [], "empty_results")
 
     @staticmethod
     def _http_reason(exc: httpx.HTTPStatusError) -> str:
@@ -652,14 +807,18 @@ class WebSearchBackend(SearchBackend):
 
     @staticmethod
     def _parse_bing(html: str) -> list[dict]:
+        # b_algo 内部可能嵌套 <ul><li>，不能用非贪婪 </li> 截断结果块。
+        # 捕获到下一个 b_algo / </ol> / 页面结束为止。
         blocks = re.findall(
-            r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)</li>',
+            r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)'
+            r'(?=<li[^>]*class="[^"]*b_algo|</ol>|</body>|$)',
             html,
             re.DOTALL | re.IGNORECASE,
         )
         if not blocks:
             blocks = re.findall(
-                r'<div[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)</div>',
+                r'<div[^>]*class="[^"]*b_algo[^"]*"[^>]*>(.*?)'
+                r'(?=<div[^>]*class="[^"]*b_algo|</body>|$)',
                 html,
                 re.DOTALL | re.IGNORECASE,
             )
@@ -674,10 +833,15 @@ class WebSearchBackend(SearchBackend):
                 continue
             url = urljoin("https://www.bing.com", html_lib.unescape(anchor.group(1)))
             title = _strip_html(anchor.group(2))
-            para = re.search(
-                r'<p[^>]*>(.*?)</p>', block, re.DOTALL | re.IGNORECASE
-            )
-            snippet = _strip_html(para.group(1)) if para else ""
+            # 摘要通常位于嵌套列表之后，取块内最后一个非空 <p>。
+            paragraphs = [
+                _strip_html(item)
+                for item in re.findall(
+                    r'<p[^>]*>(.*?)</p>', block, re.DOTALL | re.IGNORECASE
+                )
+            ]
+            paragraphs = [item for item in paragraphs if item]
+            snippet = paragraphs[-1] if paragraphs else ""
             item = _normalize_item(
                 {"title": title, "url": url, "snippet": snippet, "source": "bing"}
             )
@@ -729,6 +893,8 @@ class SearchService:
         self,
         enabled: bool = True,
         timeout_ms: int = 8000,
+        per_backend_timeout_ms: int = 0,
+        summary_input_max_chars: int = DEFAULT_SUMMARY_INPUT_MAX_CHARS,
         result_count: int = 3,
         mode: str | None = None,
         fallback_enabled: bool = False,
@@ -748,6 +914,16 @@ class SearchService:
         except (TypeError, ValueError):
             timeout_ms = 8000
         self.timeout = max(0.05, timeout_ms / 1000.0)
+        try:
+            per_backend_timeout_ms = int(per_backend_timeout_ms)
+        except (TypeError, ValueError):
+            per_backend_timeout_ms = 0
+        self.per_backend_timeout = max(0.0, per_backend_timeout_ms / 1000.0)
+        try:
+            summary_input_max_chars = int(summary_input_max_chars)
+        except (TypeError, ValueError):
+            summary_input_max_chars = DEFAULT_SUMMARY_INPUT_MAX_CHARS
+        self.summary_input_max_chars = max(200, summary_input_max_chars)
         try:
             result_count = int(result_count)
         except (TypeError, ValueError):
@@ -787,6 +963,22 @@ class SearchService:
             return list(BACKEND_ORDER[start:])
         return [self.mode]
 
+    def _attempt_timeout(
+        self, remaining: float, remaining_candidates: int
+    ) -> float:
+        """单后端超时上限/分配。
+
+        配置了 per_backend_timeout_ms 时取固定上限；否则把当前剩余预算
+        均分给尚未尝试的候选，保证前一个超时后后续仍有预算。
+        """
+        if remaining <= 0:
+            return 0.0
+        if self.per_backend_timeout > 0:
+            return min(remaining, self.per_backend_timeout)
+        if remaining_candidates <= 1:
+            return remaining
+        return remaining / remaining_candidates
+
     @staticmethod
     def _disabled_result(reason: str = "disabled") -> dict:
         return {
@@ -798,6 +990,8 @@ class SearchService:
             "attempted": [],
             "skipped": [],
             "degraded": False,
+            "partial": False,
+            "partial_failures": [],
             "effective_backend": "",
             "failure_reason": reason,
         }
@@ -823,9 +1017,12 @@ class SearchService:
                 "result_count": 0,
             })
 
-        for name in order:
+        for index, name in enumerate(order):
             remaining = deadline - loop.time()
-            if remaining <= 0:
+            attempt_budget = self._attempt_timeout(
+                remaining, len(order) - index
+            )
+            if attempt_budget <= 0:
                 skip(name, "timeout", "budget_exhausted")
                 break
 
@@ -836,13 +1033,14 @@ class SearchService:
 
             try:
                 available, reason = await asyncio.wait_for(
-                    backend.availability(event), timeout=remaining
+                    backend.availability(event), timeout=attempt_budget
                 )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                # 只消耗该后端的分配额度，让后续候选继续使用剩余预算。
                 skip(name, "timeout", "budget_exhausted")
-                break
+                continue
             except Exception:
                 available, reason = False, "backend_unavailable"
             if not available:
@@ -850,7 +1048,10 @@ class SearchService:
                 continue
 
             remaining = deadline - loop.time()
-            if remaining <= 0:
+            attempt_budget = self._attempt_timeout(
+                remaining, len(order) - index
+            )
+            if attempt_budget <= 0:
                 skip(name, "timeout", "budget_exhausted")
                 break
 
@@ -861,9 +1062,9 @@ class SearchService:
                         query,
                         self.result_count,
                         event=event,
-                        timeout_s=remaining,
+                        timeout_s=attempt_budget,
                     ),
-                    timeout=remaining,
+                    timeout=attempt_budget,
                 )
             except asyncio.CancelledError:
                 raise
@@ -890,19 +1091,26 @@ class SearchService:
                 "reason": result.reason,
                 "duration_ms": result.duration_ms,
                 "result_count": len(result.results),
+                "partial": bool(result.partial),
+                "failures": list(result.failures),
             })
 
             if result.status == "success" and result.results:
                 duration_ms = int((loop.time() - start) * 1000)
+                partial = bool(result.partial or result.failures)
                 return {
                     "status": "success",
-                    "summary": build_search_summary(result.results),
+                    "summary": build_search_summary(
+                        result.results, self.summary_input_max_chars
+                    ),
                     "provider": BACKEND_LABELS.get(name, name),
                     "duration_ms": duration_ms,
                     "results": result.results,
                     "attempted": attempts,
                     "skipped": skipped,
-                    "degraded": bool(skipped) or len(attempts) > 1,
+                    "degraded": bool(skipped) or len(attempts) > 1 or partial,
+                    "partial": partial,
+                    "partial_failures": list(result.failures),
                     "effective_backend": name,
                     "failure_reason": "",
                 }
@@ -930,6 +1138,8 @@ class SearchService:
             "attempted": attempts,
             "skipped": skipped,
             "degraded": bool(skipped) or len(attempts) > 1,
+            "partial": False,
+            "partial_failures": [],
             "effective_backend": "",
             "failure_reason": failure_reason,
         }
@@ -947,6 +1157,8 @@ class SearchService:
             "failure_reason": result.get("failure_reason", ""),
             "attempted": result.get("attempted", []),
             "skipped": result.get("skipped", []),
+            "partial": result.get("partial", False),
+            "partial_failures": result.get("partial_failures", []),
         }
 
     async def close(self) -> None:
@@ -970,6 +1182,11 @@ _REASON_TEXT = {
     "astrbot_provider_unverified": "AstrBot 搜索提供商未验证",
     "astrbot_key_missing": "AstrBot 未配置密钥",
     "astrbot_search_error": "AstrBot 搜索失败",
+    "astrbot_tool_manager_unavailable": "AstrBot 工具管理器不可用",
+    "astrbot_tool_unregistered": "AstrBot 搜索工具未注册",
+    "astrbot_tool_disabled": "AstrBot 搜索工具已停用",
+    "astrbot_retry_risk": "AstrBot 多 Key 自动重试风险",
+    "insecure_api_base_url": "API 地址必须使用 HTTPS（回环地址除外）",
     "verification_page": "验证页",
     "empty_results": "无有效结果",
     "no_results": "无有效结果",
@@ -988,6 +1205,19 @@ _REASON_TEXT = {
 }
 
 
+def format_source_failures(failures: list[dict]) -> str:
+    parts = []
+    for item in failures or []:
+        source = SOURCE_LABELS.get(
+            item.get("source", ""), item.get("source", "")
+        )
+        reason = _REASON_TEXT.get(
+            item.get("reason", ""), item.get("reason", item.get("status", ""))
+        )
+        parts.append(f"{source}（{reason}）")
+    return "、".join(parts)
+
+
 def format_search_diagnostic(result: dict) -> str:
     """管理员诊断文本：实际后端、降级、有效结果数、失败原因。"""
     status = result.get("status", "failed")
@@ -1001,7 +1231,18 @@ def format_search_diagnostic(result: dict) -> str:
         )
         count = len(result.get("results", []))
         degraded = "是" if result.get("degraded") else "否"
-        return f"搜索成功（后端：{backend}，有效结果：{count}，降级：{degraded}）"
+        partial = "是" if result.get("partial") else "否"
+        message = (
+            f"搜索成功（后端：{backend}，有效结果：{count}，"
+            f"降级：{degraded}，部分可用：{partial}"
+        )
+        if result.get("partial"):
+            failures_text = format_source_failures(
+                result.get("partial_failures", [])
+            )
+            if failures_text:
+                message += f"；失败来源：{failures_text}"
+        return message + "）"
 
     reason = _REASON_TEXT.get(
         result.get("failure_reason", ""),

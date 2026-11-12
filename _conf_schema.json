@@ -136,6 +136,18 @@
         "type": "int",
         "default": 8000,
         "hint": "整个搜索流程的总预算，所有后端共享，不会各自累加超时"
+      },
+      "per_backend_timeout_ms": {
+        "description": "单后端超时上限（毫秒）",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示按剩余预算和候选数自动分配；大于 0 时每个后端最多使用该时长，避免第一个后端耗尽全部预算"
+      },
+      "summary_input_max_chars": {
+        "description": "AI 汇总输入最大字数",
+        "type": "int",
+        "default": 6000,
+        "hint": "进入 AI 搜索汇总前的总字数预算；单条标题/摘要另有固定上限，长结果不会挤掉后续条目"
       }
     }
   },
