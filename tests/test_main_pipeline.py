@@ -284,6 +284,29 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("T1", fake_ai.prompts[0])
         self.assertNotIn("SHOULD-NOT-BE-USED", fake_ai.prompts[0])
 
+    async def test_fallback_prompt_keeps_facts_with_150_budget(self):
+        result = search_result(count=7)
+        for index, entry in enumerate(result["results"]):
+            entry["title"] = f"LongTitle-{index}-" + "T" * 80
+            entry["snippet"] = f"Fact-{index}-release-2026"
+        plugin = make_plugin(result)
+        plugin.search_summarize_enabled = False
+        plugin.search_summarize_max_chars = 150
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        await self._run(plugin)
+
+        prompt = fake_ai.prompts[0]
+        self.assertIn("Fact-0", prompt)
+        self.assertIn("Fact-3", prompt)
+        self.assertGreaterEqual(prompt.count("Fact-"), 3)
+        marker = "联网搜索到的游戏信息摘要：\n"
+        digest = prompt.split(marker, 1)[1].split(
+            "\n\n需要自动生成的字段：", 1
+        )[0]
+        self.assertLessEqual(len(digest), 150)
+
     async def test_fallback_prompt_keeps_multiple_items(self):
         plugin = make_plugin(search_result(count=3))
         plugin.search_summarize_enabled = False

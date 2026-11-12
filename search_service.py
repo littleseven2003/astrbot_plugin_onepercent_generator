@@ -144,6 +144,7 @@ def _truncate_text(text: str, max_chars: int) -> str:
 
 MIN_SUMMARY_TITLE_CHARS = 10
 MIN_SUMMARY_TITLE_WITH_SOURCE = 16
+MIN_SNIPPET_FACT_CHARS = 12
 
 
 def _truncate_title(text: str, max_chars: int) -> str:
@@ -249,11 +250,12 @@ def build_search_summary(
     """把统一结果拼成供 AI 汇总/生成参考的文本。
 
     预算规则（确定、可测试）：
-    1. 空间不足时先减少结果条数，优先输出少量可识别、可提供事实的
-       片段，而不是保留大量标签/单字符碎片；
+    1. 选择条数时同时计算标题和至少一段可理解摘要，空间不足时优先
+       输出少量有事实的片段，而不是大量标题/单字符碎片；
     2. 来源标签必须完整，放不下时直接省略，绝不输出半截标签；
     3. 标题保留开头、中部和结尾；标题预算按实际使用量回收；
-    4. 摘要预留按实际摘要长度申请（最多 40%），短摘要不会占固定空间；
+    4. 摘要预留按实际摘要长度申请；有摘要时至少保住每条可理解的
+       事实长度，短摘要不会占用固定空间；
     5. 剩余预算优先均分给摘要；
     6. 仍有空间时才追加完整 URL，绝不放宽为“截断后的假 URL”；
     7. 最终长度严格不超过总预算。
@@ -284,37 +286,50 @@ def build_search_summary(
         total = DEFAULT_SUMMARY_INPUT_MAX_CHARS
     total = max(1, total)
 
-    # 以实际标题/来源长度决定能保留多少条，而不是固定假设每条 32 字。
+    # 以实际标题/来源长度和至少一段可理解摘要决定能保留多少条。
     min_headers = []
-    for source, title, _snippet, _url in items:
+    min_snippets = []
+    for source, title, snippet, _url in items:
         label = f"[{source}] " if source else ""
         min_headers.append(
             len(label) + min(len(title), MIN_SUMMARY_TITLE_CHARS)
+        )
+        min_snippets.append(
+            1 + min(len(snippet), MIN_SNIPPET_FACT_CHARS)
+            if snippet else 0
         )
 
     selected_count = 1
     for candidate in range(len(items), 0, -1):
         if (
-            sum(min_headers[:candidate]) + 2 * (candidate - 1)
+            sum(min_headers[:candidate])
+            + sum(min_snippets[:candidate])
+            + 2 * (candidate - 1)
             <= total
         ):
             selected_count = candidate
             break
     items = items[:selected_count]
     min_headers = min_headers[:selected_count]
+    min_snippets = min_snippets[:selected_count]
     count = len(items)
     separators = 2 * (count - 1)
     available = total - separators
 
-    # 摘要按实际长度申请，且不能吃掉已选条目的最低标题空间。
+    # 摘要按实际长度申请；有摘要时至少保住每条的“可理解事实”长度。
     snippet_need = sum(
         1 + min(len(item[2]), MAX_SNIPPET_CHARS)
         for item in items
         if item[2]
     )
+    min_snippet_need = sum(min_snippets)
     max_reserve = max(0, available - sum(min_headers))
     snippet_reserve = min(
-        int(available * 0.4), snippet_need, max_reserve
+        max_reserve,
+        max(
+            min_snippet_need,
+            min(snippet_need, int(available * 0.4)),
+        ),
     )
     header_available = available - snippet_reserve
     if header_available <= sum(min_headers):
@@ -913,7 +928,6 @@ class _BingResultParser(HTMLParser):
 class _BaiduResultFrame:
     def __init__(self, depth: int):
         self.depth = depth
-        self.group = False
         self.in_title = False
         self.title_anchor_seen = False
         self.title_parts: list[str] = []
@@ -931,15 +945,14 @@ class _BaiduResultParser(HTMLParser):
     """按容器栈解析 Baidu 结果。
 
     规则矩阵：
-    - 单独 result：叶子结果；
-    - 单独 c-container：叶子结果；
-    - result + c-container 同一元素：一个叶子结果；
-    - 外层 c-container/result 含内层 result：外层是分组容器，内层叶子
-      分别成为结果，外层自身的标题/摘要不参与归属；
-    - 无子结果容器的 c-container 才按叶子结果解析。
-
-    摘要只接受当前叶子容器内 c-abstract/abstract；外层分组、容器外
-    content-right 广告和相邻结果都不会被拼入。
+    - 单独 result / c-container / 同元素组合：自身有标题即结果；
+    - 内层候选没有标题：视为当前结果的布局或摘要包装，摘要可上推给
+      最近的有标题祖先；
+    - 内层候选有标题：视为独立结果，父子各自保留标题/URL/摘要；
+    - 外层无标题且包含多个有标题子结果：各子结果分别输出；
+    - 外层无标题且只有摘要包装：不能凭空产生结果，丢弃摘要；
+    - 摘要只接受当前叶子候选内 c-abstract/abstract；相邻结果、侧栏、
+      content-right 广告不拼接。
     """
 
     def __init__(self):
@@ -968,9 +981,9 @@ class _BaiduResultParser(HTMLParser):
         frame.snippet_tag = None
         frame.snippet_parts = []
 
-    def _finish_frame(self, frame: _BaiduResultFrame):
-        if frame.group:
-            return
+    def _finish_frame(
+        self, frame: _BaiduResultFrame, parent: _BaiduResultFrame | None
+    ):
         self._finish_title(frame)
         self._finish_snippet(frame)
         title = "".join(frame.title_parts).strip()
@@ -980,22 +993,23 @@ class _BaiduResultParser(HTMLParser):
                 "url": frame.url,
                 "snippet": frame.snippet,
             })
+            return
+        # 无标题的内层容器是布局/摘要包装：把摘要上推给最近的有标题
+        # 祖先；已有直接摘要时优先保留祖先自己的摘要。
+        if frame.snippet and parent is not None and not parent.snippet:
+            parent.snippet = frame.snippet
 
     def handle_starttag(self, tag, attrs):
         self.tag_depth[tag] = self.tag_depth.get(tag, 0) + 1
         if tag == "div":
             self.div_depth += 1
             if self._is_candidate(attrs):
-                if self.stack:
-                    self.stack[-1].group = True
                 self.stack.append(_BaiduResultFrame(self.div_depth))
                 return
 
         if not self.stack:
             return
         frame = self.stack[-1]
-        if frame.group:
-            return
         if tag == "h3":
             frame.h3_depth += 1
             return
@@ -1037,25 +1051,26 @@ class _BaiduResultParser(HTMLParser):
             and self.stack
             and self.div_depth == self.stack[-1].depth
         ):
-            self._finish_frame(self.stack.pop())
+            frame = self.stack.pop()
+            parent = self.stack[-1] if self.stack else None
+            self._finish_frame(frame, parent)
             self.tag_depth[tag] = max(0, self.tag_depth.get(tag, 0) - 1)
             self.div_depth = max(0, self.div_depth - 1)
             return
 
         if self.stack:
             frame = self.stack[-1]
-            if not frame.group:
-                if tag == "a" and frame.in_title:
-                    self._finish_title(frame)
-                elif tag == "h3":
-                    frame.h3_depth = max(0, frame.h3_depth - 1)
-                if (
-                    tag == frame.snippet_tag
-                    and frame.in_snippet
-                    and self.tag_depth.get(tag, 0)
-                    == frame.snippet_tag_depth
-                ):
-                    self._finish_snippet(frame)
+            if tag == "a" and frame.in_title:
+                self._finish_title(frame)
+            elif tag == "h3":
+                frame.h3_depth = max(0, frame.h3_depth - 1)
+            if (
+                tag == frame.snippet_tag
+                and frame.in_snippet
+                and self.tag_depth.get(tag, 0)
+                == frame.snippet_tag_depth
+            ):
+                self._finish_snippet(frame)
 
         if self.tag_depth.get(tag, 0) > 0:
             self.tag_depth[tag] -= 1
@@ -1066,8 +1081,6 @@ class _BaiduResultParser(HTMLParser):
         if not self.stack:
             return
         frame = self.stack[-1]
-        if frame.group:
-            return
         if frame.in_title:
             frame.title_parts.append(data)
         if frame.in_snippet:

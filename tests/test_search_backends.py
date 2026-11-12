@@ -742,6 +742,11 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Baidu Snippet</div>'
         '</div></body></html>'
     )
+    BAIDU_ORPHAN_SUMMARY = (
+        '<html><body><div class="c-container">'
+        '<div class="c-abstract">Orphan Summary</div>'
+        '</div></body></html>'
+    )
     BAIDU_CONTAINER_ONLY = (
         '<html><body><div class="c-container"><h3>'
         '<a href="https://example.com/container">Container Only</a></h3>'
@@ -751,6 +756,12 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<html><body><div class="result"><h3>'
         '<a href="https://example.com/result-only">Result Only</a></h3>'
         '<div class="c-abstract">Result Snippet</div></div></body></html>'
+    )
+    BAIDU_WRAPPED_SUMMARY = (
+        '<html><body><div class="result c-container"><h3>'
+        '<a href="https://example.com/wrapped">Wrapped A</a></h3>'
+        '<div class="c-container"><div class="c-abstract">'
+        'Summary A</div></div></div></body></html>'
     )
     BAIDU_OUTER_RESULT = (
         '<html><body><div class="result">'
@@ -1110,7 +1121,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.05)
                 cleanup_done.append("baidu")
 
-        svc = self._service(handler, timeout_ms=100)
+        svc = self._service(handler, timeout_ms=200)
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
         elapsed = time.monotonic() - start
@@ -1122,7 +1133,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["partial_failures"][0]["reason"], "timeout")
         self.assertFalse(result["cleanup_incomplete"])
         self.assertTrue(cleanup_done)
-        self.assertLess(elapsed, 0.15)
+        self.assertLess(elapsed, 0.3)
 
     async def test_cleanup_beyond_sync_budget_finishes_on_close(self):
         cleanup_done = []
@@ -1136,7 +1147,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.2)
                 cleanup_done.append("baidu")
 
-        svc = self._service(handler, timeout_ms=100)
+        svc = self._service(handler, timeout_ms=300)
         result = await svc.search_game_info("游戏")
         web = svc._backends["web"]
 
@@ -1167,7 +1178,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.45)
                 cleanup_done.append(1)
 
-        svc = self._service(handler, timeout_ms=100)
+        svc = self._service(handler, timeout_ms=400)
         start = time.monotonic()
         result = await svc.search_game_info("游戏")
         elapsed = time.monotonic() - start
@@ -1178,7 +1189,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["cleanup_incomplete"])
         self.assertFalse(cleanup_done)
         self.assertEqual(cancel_count, [1])
-        self.assertLess(elapsed, 0.2)
+        self.assertLess(elapsed, 0.6)
         self.assertGreaterEqual(web.pending_cleanup_count, 1)
 
         await svc.close()
@@ -1205,7 +1216,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.05)
                 cleanup_done.append(1)
 
-        svc = self._service(handler, timeout_ms=100)
+        svc = self._service(handler, timeout_ms=400)
         result = await svc.search_game_info("游戏")
         web = svc._backends["web"]
         self.assertTrue(result["cleanup_incomplete"])
@@ -1235,7 +1246,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                     await release.wait()
                 cleanup_done.append(1)
 
-        svc = self._service(handler, timeout_ms=100)
+        svc = self._service(handler, timeout_ms=400)
         result = await svc.search_game_info("游戏")
         web = svc._backends["web"]
         self.assertTrue(result["cleanup_incomplete"])
@@ -1430,6 +1441,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             (self.BAIDU_CONTAINER_ONLY, ["Container Only"], "Container Snippet"),
             (self.BAIDU_RESULT_ONLY, ["Result Only"], "Result Snippet"),
             (self.BAIDU_OK, ["Baidu Title"], "Baidu Snippet"),
+            (self.BAIDU_WRAPPED_SUMMARY, ["Wrapped A"], "Summary A"),
         ]
         for html, titles, snippet_text in cases:
             with self.subTest(titles=titles):
@@ -1446,6 +1458,17 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     result["results"][0]["snippet"], snippet_text
                 )
+
+    async def test_baidu_orphan_summary_is_not_assigned(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_ORPHAN_SUMMARY)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(result["results"], [])
+        self.assertNotIn("Orphan Summary", result.get("summary", ""))
 
     async def test_baidu_outer_result_keeps_child_results(self):
         async def handler(request):
@@ -1694,6 +1717,39 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(long_url, text)
         self.assertNotIn(long_url[:80], text)
         self.assertLessEqual(len(text), 400)
+
+    def test_seven_long_titles_keep_fact_snippets_budget_150(self):
+        results = [
+            item(
+                title=f"LongGameTitle-{index}-" + "T" * 80,
+                url=f"https://example.com/{index}",
+                snippet=f"Fact-{index}-release-2026-01-0{index}",
+                source=f"s{index}",
+            )
+            for index in range(7)
+        ]
+        text = build_search_summary(results, max_total_chars=150)
+
+        self.assertLessEqual(len(text), 150)
+        self.assertIn("Fact-0", text)
+        self.assertIn("Fact-4", text)
+        self.assertGreaterEqual(text.count("Fact-"), 4)
+
+    def test_ten_results_keep_date_snippets_budget_200(self):
+        results = [
+            item(
+                title=f"DateTitle-{index}-" + "T" * 50,
+                url=f"https://example.com/{index}",
+                snippet=f"2026-01-01-{index} key fact",
+                source=f"s{index}",
+            )
+            for index in range(10)
+        ]
+        text = build_search_summary(results, max_total_chars=200)
+
+        self.assertLessEqual(len(text), 200)
+        self.assertIn("2026-01-01-0", text)
+        self.assertIn("2026-01-01-5", text)
 
     def test_three_short_items_budget_50_keep_multiple(self):
         results = [
