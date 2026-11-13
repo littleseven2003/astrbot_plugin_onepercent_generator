@@ -1,8 +1,8 @@
 {
   "admin_qqs": {
-    "description": "管理员QQ号列表",
+    "description": "管理员发送者 ID/UID 列表",
     "type": "list",
-    "hint": "输入管理员的QQ号，支持多个",
+    "hint": "填写发送者 ID/UID（可执行 AstrBot /sid 查看 UID）。QQ 官方机器人常为 OpenID，不是 UMO，也不是群号；不要填写群 UMO。",
     "default": []
   },
   "ai_config": {
@@ -151,16 +151,30 @@
       }
     }
   },
-  "whitelist_groups": {
-    "description": "白名单群聊列表",
+  "whitelist_mode": {
+    "description": "会话白名单模式",
+    "type": "string",
+    "options": ["legacy", "umo"],
+    "labels": ["兼容旧群号/QQ号白名单", "统一 UMO 会话白名单"],
+    "default": "legacy",
+    "hint": "legacy 只使用旧群/私聊列表；umo 只使用统一 UMO 列表，不会把新旧列表做 OR。升级后默认保持旧权限结果。"
+  },
+  "whitelist_umos": {
+    "description": "统一 UMO 会话白名单",
     "type": "list",
-    "hint": "留空表示所有群聊均可使用。填写群号后，仅这些群聊可使用小作文功能",
+    "hint": "在目标会话执行 AstrBot /sid，复制 UMO 字符串本身（实际平台实例 ID 为准，不要带「」或空格）。空列表不限制；非空时仅完整、大小写敏感的 UMO 精确匹配。unique_session 开启时群 UMO 可能包含发送者，群内一个 UMO 不必然允许整个群。",
+    "default": []
+  },
+  "whitelist_groups": {
+    "description": "旧版白名单群聊列表",
+    "type": "list",
+    "hint": "仅 legacy 模式使用。留空表示所有群聊均可使用；填写群号后仅这些群可用。不要填写 UMO。",
     "default": []
   },
   "whitelist_privates": {
-    "description": "白名单私聊列表",
+    "description": "旧版白名单私聊列表",
     "type": "list",
-    "hint": "留空表示所有私聊均可使用。填写QQ号后，仅这些私聊可使用小作文功能",
+    "hint": "仅 legacy 模式使用。留空表示所有私聊均可使用；填写发送者 ID/QQ 号后仅这些私聊可用。不要根据 QQ 号猜 OpenID。",
     "default": []
   },
   "show_generation_stats": {

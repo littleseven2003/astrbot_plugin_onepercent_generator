@@ -118,9 +118,17 @@ class FakeEvent:
 
 
 class FakeAIClient:
-    def __init__(self, summarize_text="", summarize_error=None):
+    def __init__(
+        self,
+        summarize_text="",
+        summarize_error=None,
+        generate_content="正文",
+        generate_truncated=False,
+    ):
         self.summarize_text = summarize_text
         self.summarize_error = summarize_error
+        self.generate_content = generate_content
+        self.generate_truncated = generate_truncated
         self.prompts = []
         self.summarize_calls = []
 
@@ -137,7 +145,7 @@ class FakeAIClient:
     async def generate(self, prompt):
         self.prompts.append(prompt)
         return {
-            "content": "正文",
+            "content": self.generate_content,
             "model": "mock-model",
             "api_format": "chat_completions",
             "duration_ms": 1,
@@ -146,6 +154,8 @@ class FakeAIClient:
                 "completion_tokens": 1,
                 "total_tokens": 2,
             },
+            "finish_reason": "length" if self.generate_truncated else "stop",
+            "truncated": self.generate_truncated,
         }
 
     async def close(self):
@@ -236,6 +246,13 @@ def search_result(summary="RAW" * 200, count=2):
             "reason": "",
             "duration_ms": 5,
             "result_count": count,
+        }],
+        "skipped": [{
+            "backend": "astrbot",
+            "status": "unavailable",
+            "reason": "astrbot_contract_unverified",
+            "duration_ms": 0,
+            "result_count": 0,
         }],
         "degraded": True,
         "partial": False,
@@ -329,6 +346,45 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertTrue(messages)
 
+    async def test_final_message_has_activity_title_and_truncation_warning(self):
+        body = (
+            "发售平台：PC\n"
+            "游玩时间：20 小时\n"
+            "推荐人群及理由：喜欢农场经营的人。\n"
+            "游戏介绍：农场经营游戏。\n"
+            "故事/感想：我玩了 20 小时，喜欢钓鱼。"
+        )
+        plugin = make_plugin(search_result())
+        fake_ai = FakeAIClient(
+            generate_content=body, generate_truncated=True
+        )
+        plugin.ai_client = fake_ai
+        event = FakeEvent("小作文 星露谷物语 经历：我玩了 20 小时，喜欢钓鱼。")
+
+        _, messages = await self._run(plugin, event)
+
+        final = [
+            m["text"] for m in messages
+            if m["text"].startswith("【我的百分之一】")
+        ][0]
+        self.assertIn("【我的百分之一】+【星露谷物语】", final)
+        self.assertIn("模型输出达到长度上限", final)
+        self.assertIn("不会自动发布", final)
+
+    async def test_short_article_gets_supplement_warning(self):
+        plugin = make_plugin(search_result())
+        fake_ai = FakeAIClient(generate_content="发售平台：PC")
+        plugin.ai_client = fake_ai
+
+        _, messages = await self._run(plugin)
+
+        final = [
+            m["text"] for m in messages
+            if m["text"].startswith("【我的百分之一】")
+        ][0]
+        self.assertIn("低于建议", final)
+        self.assertIn("未自动重试", final)
+
     async def test_summary_budget_applied_to_generate_prompt(self):
         plugin = make_plugin(search_result())
         fake_ai = FakeAIClient(summarize_text="AI" * 200)
@@ -345,8 +401,10 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         digest = _extract_search_digest(prompt)
         self.assertLessEqual(len(digest), 40)
         self.assertTrue(event.stopped)
-        self.assertTrue(any(m["text"].startswith("什么是【我的百分之一】")
-                            for m in messages))
+        self.assertTrue(any(
+            m["text"].startswith("【我的百分之一】+【测试游戏】")
+            for m in messages
+        ))
 
     async def test_summarize_failure_rebuilds_structured_summary(self):
         plugin = make_plugin(search_result())
@@ -461,6 +519,55 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("搜索部分可用：是", stats[0])
         self.assertIn("部分失败来源：百度（超时）", stats[0])
         self.assertIn("搜索清理：未完成", stats[0])
+
+    async def test_generation_stats_distinguish_all_failed(self):
+        failed = {
+            "status": "failed",
+            "summary": "",
+            "provider": "失败",
+            "duration_ms": 1,
+            "results": [],
+            "attempted": [{"backend": "astrbot", "status": "unavailable",
+                           "reason": "astrbot_call_contract_unverified"}],
+            "skipped": [],
+            "effective_backend": "",
+            "failure_reason": "astrbot_call_contract_unverified",
+        }
+        plugin = make_plugin(failed)
+        plugin.show_generation_stats = True
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        _, messages = await self._run(plugin)
+
+        stats = [m["text"] for m in messages if "本次生成信息" in m["text"]][0]
+        self.assertIn("搜索状态：全部候选后端失败", stats)
+        self.assertIn("搜索降级：否（全部失败）", stats)
+        self.assertIn("搜索失败原因：astrbot_call_contract_unverified", stats)
+
+    async def test_generation_stats_distinguish_search_disabled(self):
+        disabled = {
+            "status": "disabled",
+            "summary": "",
+            "provider": "未启用",
+            "duration_ms": 0,
+            "results": [],
+            "attempted": [],
+            "skipped": [],
+            "degraded": False,
+            "effective_backend": "",
+            "failure_reason": "disabled",
+        }
+        plugin = make_plugin(disabled)
+        plugin.show_generation_stats = True
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        _, messages = await self._run(plugin)
+
+        stats = [m["text"] for m in messages if "本次生成信息" in m["text"]][0]
+        self.assertIn("搜索状态：未调用（搜索关闭）", stats)
+        self.assertIn("搜索降级：未调用（搜索关闭）", stats)
 
     async def test_generation_stats_show_backend_and_degraded(self):
         plugin = make_plugin(search_result(count=2))

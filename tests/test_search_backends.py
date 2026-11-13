@@ -28,6 +28,7 @@ from astrbot_plugin_onepercent_generator.search_service import (  # noqa: E402
     format_search_diagnostic,
     prepare_search_digest,
     resolve_search_mode,
+    search_outcome_label,
 )
 
 
@@ -2324,11 +2325,48 @@ class ManagedEvent:
     unified_msg_origin = "webchat:managed-test"
 
 
+class SearchOutcomeLabelTests(unittest.TestCase):
+    def test_outcome_labels_distinguish_switch_and_all_failed(self):
+        self.assertEqual(
+            search_outcome_label({
+                "status": "success",
+                "degraded": True,
+                "effective_backend": "api",
+                "attempted": [{"backend": "api"}],
+                "skipped": [{"backend": "astrbot"}],
+            }),
+            "已切换到其他后端",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "failed",
+                "attempted": [{"backend": "astrbot"}],
+            }),
+            "全部候选后端失败",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "disabled",
+                "attempted": [],
+            }),
+            "未调用（搜索关闭）",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "failed",
+                "attempted": [],
+                "skipped": [{"backend": "web"}],
+            }),
+            "未调用（无可用后端）",
+        )
+
+
 class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _fake_astrbot_modules():
+    def _fake_astrbot_modules(version="4.29.4"):
         astrbot = types.ModuleType("astrbot")
-        astrbot.__version__ = "4.29.4"
+        if version is not None:
+            astrbot.__version__ = version
         core = types.ModuleType("astrbot.core")
         agent = types.ModuleType("astrbot.core.agent")
         run_context = types.ModuleType("astrbot.core.agent.run_context")
@@ -2406,6 +2444,59 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(available, reason)
         self.assertEqual(reason, "")
 
+    async def test_unknown_version_with_verified_contract_is_available(self):
+        tool = FakeManagedTool(active=True)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules(version="9.9.9"):
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertTrue(available, reason)
+        self.assertEqual(reason, "")
+
+    async def test_missing_version_with_verified_contract_is_available(self):
+        tool = FakeManagedTool(active=True)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules(version=None):
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertTrue(available, reason)
+        self.assertEqual(reason, "")
+
+    async def test_broken_tool_call_contract_is_unavailable(self):
+        class BadCallTool:
+            active = True
+
+            async def call(self, **kwargs):
+                return "{}"
+
+        class QueryFirstTool:
+            active = True
+
+            async def call(self, query, max_results):
+                return "{}"
+
+        for tool in (BadCallTool(), QueryFirstTool()):
+            with self.subTest(tool=type(tool).__name__):
+                context = ManagedContext(
+                    self._cfg(), FakeToolManager(tool=tool)
+                )
+                with self._fake_astrbot_modules(version="9.9.9"):
+                    backend = AstrBotSearchBackend(context=context)
+                    available, reason = await backend.availability(
+                        ManagedEvent()
+                    )
+
+                self.assertFalse(available)
+                self.assertEqual(
+                    reason, "astrbot_call_contract_unverified"
+                )
+
     async def test_search_uses_managed_tool_instance(self):
         tool = FakeManagedTool(active=True)
         manager = FakeToolManager(tool=tool)
@@ -2477,14 +2568,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(available)
         self.assertEqual(reason, "astrbot_context_missing")
 
-    async def test_unverified_environment_is_unavailable(self):
-        try:
-            import astrbot  # type: ignore
-            if getattr(astrbot, "__version__", "") in {"4.29.4"}:
-                self.skipTest("AstrBot 4.29.4 已安装，契约适配器可用")
-        except Exception:
-            pass
-
+    async def test_missing_contract_modules_are_unavailable(self):
         class Cfg(dict):
             pass
 
@@ -2498,16 +2582,24 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 })
 
+            def get_llm_tool_manager(self):
+                return FakeToolManager()
+
         class Event:
             unified_msg_origin = "webchat:test"
 
-        backend = AstrBotSearchBackend(context=Context())
-        available, reason = await backend.availability(Event())
+        astrbot = types.ModuleType("astrbot")
+        astrbot.__version__ = "9.9.9"
+        with patch.dict(sys.modules, {
+            "astrbot": astrbot,
+            "astrbot.core.agent.run_context": None,
+            "astrbot.core.astr_agent_context": None,
+        }):
+            backend = AstrBotSearchBackend(context=Context())
+            available, reason = await backend.availability(Event())
+
         self.assertFalse(available)
-        self.assertIn(reason, {
-            "astrbot_contract_unavailable",
-            "astrbot_version_unverified",
-        })
+        self.assertEqual(reason, "astrbot_contract_unavailable")
 
 
 if __name__ == "__main__":

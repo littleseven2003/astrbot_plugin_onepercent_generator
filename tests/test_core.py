@@ -63,7 +63,58 @@ class PromptAndPostProcessTests(unittest.TestCase):
         message = build_final_message("原神", "发售平台：PC")
 
         self.assertIn("游戏名称：原神", message)
-        self.assertTrue(message.startswith("什么是【我的百分之一】"))
+        self.assertTrue(
+            message.startswith("【我的百分之一】+【原神】")
+        )
+        self.assertIn("什么是【我的百分之一】", message)
+        self.assertIn("不会自动发布", message)
+
+    def test_placeholders_are_not_in_publishable_body(self):
+        ai_body = (
+            "发售平台：PC\n"
+            "游玩时间：未提供\n"
+            "推荐人群及理由：待补充\n"
+            "游戏介绍：农场经营游戏。\n"
+            "故事/感想：未提供"
+        )
+
+        message = build_final_message("星露谷物语", ai_body)
+        body = message.split("---", 1)[0]
+
+        self.assertNotIn("游玩时间：未提供", body)
+        self.assertNotIn("推荐人群及理由：待补充", body)
+        self.assertNotIn("故事/感想：未提供", body)
+        self.assertIn("游戏介绍：农场经营游戏。", body)
+        self.assertIn("发布前提示", message)
+        self.assertIn("游玩时间", message)
+
+    def test_missing_experience_story_is_outside_body(self):
+        ai_body = "发售平台：PC\n游戏介绍：农场经营游戏。"
+
+        message = build_final_message(
+            "星露谷物语", ai_body, experience=""
+        )
+        body = message.split("---", 1)[0]
+
+        self.assertNotIn("故事/感想", body)
+        self.assertIn("故事/感想", message)
+        self.assertIn("补充方式：小作文 星露谷物语 经历", message)
+
+    def test_experience_story_remains_in_body(self):
+        ai_body = (
+            "发售平台：PC\n游玩时间：20 小时\n"
+            "推荐人群及理由：喜欢农场经营的人。\n"
+            "游戏介绍：农场经营游戏。\n故事/感想：我玩了 20 小时，喜欢钓鱼。"
+        )
+
+        message = build_final_message(
+            "星露谷物语", ai_body, experience="我玩了 20 小时，喜欢钓鱼。"
+        )
+        body = message.split("---", 1)[0]
+
+        self.assertIn("游玩时间：20 小时", body)
+        self.assertIn("故事/感想：我玩了 20 小时，喜欢钓鱼。", body)
+        self.assertNotIn("故事/感想：未提供", body)
 
 
 class WhitelistTests(unittest.TestCase):
@@ -74,6 +125,115 @@ class WhitelistTests(unittest.TestCase):
     def test_configured_whitelist_rejects_unknown_session(self):
         self.assertFalse(
             is_session_allowed("100", "group", ["101"], ["201"])
+        )
+
+    def test_legacy_empty_lists_keep_each_side_independent(self):
+        self.assertTrue(
+            is_session_allowed("100", "group", [], ["201"])
+        )
+        self.assertFalse(
+            is_session_allowed("100", "group", ["101"], ["201"])
+        )
+        self.assertTrue(
+            is_session_allowed("200", "private", ["101"], [])
+        )
+        self.assertFalse(
+            is_session_allowed("200", "private", ["101"], ["201"])
+        )
+
+    def test_umo_exact_match_and_empty_semantics(self):
+        self.assertTrue(
+            is_session_allowed(
+                "", "private", [], [], mode="umo",
+                umo="qq_official_bot_a:FriendMessage:openid-1",
+                whitelist_umos=[],
+            )
+        )
+        self.assertTrue(
+            is_session_allowed(
+                "", "private", [], [], mode="umo",
+                umo="qq_official_bot_a:FriendMessage:openid-1",
+                whitelist_umos=["qq_official_bot_a:FriendMessage:openid-1"],
+            )
+        )
+        self.assertFalse(
+            is_session_allowed(
+                "", "private", [], [], mode="umo",
+                umo="qq_official_bot_a:FriendMessage:openid-2",
+                whitelist_umos=["qq_official_bot_a:FriendMessage:openid-1"],
+            )
+        )
+
+    def test_umo_missing_or_case_diff_is_denied_when_configured(self):
+        allowed = ["qq_official_bot_a:GroupMessage:group-1"]
+        self.assertFalse(
+            is_session_allowed(
+                "", "group", [], [], mode="umo",
+                umo="", whitelist_umos=allowed,
+            )
+        )
+        self.assertFalse(
+            is_session_allowed(
+                "", "group", [], [], mode="umo",
+                umo="qq_official_bot_a:GroupMessage:GROUP-1",
+                whitelist_umos=allowed,
+            )
+        )
+        self.assertFalse(
+            is_session_allowed(
+                "", "group", [], [], mode="umo",
+                umo="qq_official_bot_b:GroupMessage:group-1",
+                whitelist_umos=allowed,
+            )
+        )
+
+    def test_umo_mode_does_not_or_legacy_lists(self):
+        self.assertFalse(
+            is_session_allowed(
+                "100", "group", ["100"], ["200"], mode="umo",
+                umo="other", whitelist_umos=["allowed"],
+            )
+        )
+        self.assertFalse(
+            is_session_allowed(
+                "100", "group", ["100"], ["200"], mode="umo",
+                umo="", whitelist_umos=["allowed"],
+            )
+        )
+
+    def test_legacy_mode_ignores_umo_list(self):
+        self.assertTrue(
+            is_session_allowed(
+                "100", "group", [], [], mode="legacy",
+                umo="not-allowed", whitelist_umos=["allowed"],
+            )
+        )
+
+    def test_invalid_umo_config_fails_closed(self):
+        for invalid in ("", 123, object()):
+            with self.subTest(invalid=type(invalid).__name__):
+                self.assertFalse(
+                    is_session_allowed(
+                        "", "private", [], [], mode="umo",
+                        umo="qq_bot:FriendMessage:openid-1",
+                        whitelist_umos=invalid,
+                    )
+                )
+
+    def test_unique_session_group_umos_are_not_group_wide(self):
+        first = "qq_official_bot_a:GroupMessage:openid-1_group-1"
+        second = "qq_official_bot_a:GroupMessage:openid-2_group-1"
+        self.assertTrue(
+            is_session_allowed(
+                "", "group", [], [], mode="umo",
+                umo=first, whitelist_umos=[first],
+            )
+        )
+        self.assertFalse(
+            is_session_allowed(
+                "", "group", [], [], mode="umo",
+                umo=second, whitelist_umos=[first],
+            )
         )
 
 
@@ -186,6 +346,37 @@ class AIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["model"], "chat-model")
         self.assertEqual(result["api_format"], API_FORMAT_CHAT_COMPLETIONS)
         self.assertEqual(result["token_usage"]["total_tokens"], 30)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["finish_reason"], "")
+
+    async def test_chat_length_finish_marks_truncated(self):
+        async def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "model": "chat-model",
+                    "choices": [{
+                        "message": {"content": "被截断的正文"},
+                        "finish_reason": "length",
+                    }],
+                },
+            )
+
+        client = AIClient(
+            base_url="https://example.com/v1",
+            api_key="test-key",
+            model="configured-model",
+        )
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        try:
+            result = await client.generate("生成内容")
+        finally:
+            await client.close()
+
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["finish_reason"], "length")
 
     async def test_responses_request_and_response(self):
         async def handler(request):

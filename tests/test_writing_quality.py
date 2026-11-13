@@ -133,6 +133,8 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertIn("搜索资料可以用于发售平台等客观游戏信息", prompt)
         self.assertIn("不得覆盖或扩写用户经历", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
+        self.assertIn("正文约 500-800 个中文字", prompt)
+        self.assertIn("不要输出“未提供”", prompt)
 
     def test_experience_prompt_allows_objective_platform_from_search(self):
         prompt = build_main_prompt(
@@ -143,7 +145,7 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         )
 
         self.assertIn("发售平台：可基于搜索资料", prompt)
-        self.assertIn("不得把搜索资料写成个人经历", prompt)
+        self.assertIn("不得当作你的个人经历", prompt)
         self.assertNotIn("发售平台：只写经历", prompt)
         self.assertIn("发售平台为 PC、iOS、Android、PS5", prompt)
 
@@ -157,6 +159,8 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertIn("不要虚构具体游玩时长", prompt)
         self.assertIn("不得写成用户经历", prompt)
         self.assertIn("改写客观推荐理由", prompt)
+        self.assertIn("用户未提供，省略这一节", prompt)
+        self.assertIn("正文约 500-800 个中文字", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
         self.assertNotIn("根据你对该游戏的了解自然生成", prompt)
 
@@ -241,7 +245,10 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
 
         self.assertNotIn("标题：错误", cleaned)
         self.assertIn("游戏名称：原神", final)
-        self.assertTrue(final.startswith("什么是【我的百分之一】"))
+        self.assertTrue(
+            final.startswith("【我的百分之一】+【原神】")
+        )
+        self.assertIn("什么是【我的百分之一】", final)
 
 
 if __name__ == "__main__":
