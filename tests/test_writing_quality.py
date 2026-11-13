@@ -67,7 +67,7 @@ class WritingRequestParsingTests(unittest.TestCase):
             (True, "原神", ""),
         )
 
-    def test_experience_only_uses_random_game(self):
+    def test_experience_only_is_parsed_without_game(self):
         matched, game_name, experience = parse_writing_request(
             "小作文 经历：我玩了 20 小时"
         )
