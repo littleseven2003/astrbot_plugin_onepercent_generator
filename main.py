@@ -121,17 +121,9 @@ class OnePercentGenerator(Star):
         if not matched:
             return
 
-        # 只提供经历、没有游戏名时，不能随机换成另一个游戏；先请用户
-        # 补齐游戏名，避免把经历挂到无关游戏上。
-        if needs_explicit_game(game_name, experience):
-            yield event.plain_result(GAME_REQUIRED_MESSAGE)
-            event.stop_event()
-            return
-
-        # 管理员不受白名单限制
+        # 管理员不受白名单限制；非白名单用户沿用原有拒绝策略。
         sender_id = event.get_sender_id()
         if sender_id not in self.admin_qqs:
-            # 白名单检查
             session_id, session_type = self._get_session_info(event)
             if not is_session_allowed(
                 session_id, session_type,
@@ -141,7 +133,14 @@ class OnePercentGenerator(Star):
                 event.stop_event()
                 return
 
-            # 频率限制检查
+        # 白名单通过后再检查缺游戏名；该提示不消耗频率额度，也不搜索。
+        if needs_explicit_game(game_name, experience):
+            yield event.plain_result(GAME_REQUIRED_MESSAGE)
+            event.stop_event()
+            return
+
+        # 只有实际执行生成的非管理员才消耗频率额度。
+        if sender_id not in self.admin_qqs:
             rate_check = await self.rate_limiter.check_and_record(sender_id, self)
             if not rate_check["allowed"]:
                 yield event.plain_result(rate_check["message"])
