@@ -11,7 +11,13 @@ from astrbot.api.star import Context, Star, register
 
 from .ai_client import AIClient, AIClientError
 from .post_process import build_final_message
-from .prompt import build_main_prompt
+from .prompt import (
+    GAME_REQUIRED_MESSAGE,
+    build_main_prompt,
+    choose_writing_variant,
+    needs_explicit_game,
+    parse_writing_request,
+)
 from .rate_limiter import RateLimiter
 from .search_service import (
     BACKEND_LABELS,
@@ -124,28 +130,9 @@ class OnePercentGenerator(Star):
         return random.choice(self.preset_games)
 
     def _match_keyword(self, text: str) -> tuple[bool, str]:
-        """
-        匹配关键词
-
-        Returns:
-            (matched, game_name)
-            - matched: 是否匹配到关键词
-            - game_name: 游戏名称（空字符串表示随机选择）
-        """
-        text = text.strip()
-
-        # 精确匹配 → 随机游戏
-        if text in ("小作文", "我的百分之一"):
-            return True, ""
-
-        # 前缀匹配 → 指定游戏
-        for prefix in ("小作文 ", "我的百分之一 "):
-            if text.startswith(prefix):
-                game_name = text[len(prefix):].strip()
-                if game_name:
-                    return True, game_name
-
-        return False, ""
+        """兼容旧调用：只返回是否匹配和游戏名。"""
+        matched, game_name, _experience = parse_writing_request(text)
+        return matched, game_name
 
     # ========================================================================
     # 消息监听：关键词触发生成
@@ -155,15 +142,14 @@ class OnePercentGenerator(Star):
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，匹配关键词触发"""
         text = event.message_str.strip()
-        matched, game_name = self._match_keyword(text)
+        matched, game_name, experience = parse_writing_request(text)
 
         if not matched:
             return
 
-        # 管理员不受白名单限制
+        # 管理员不受白名单限制；非白名单用户沿用原有拒绝策略。
         sender_id = event.get_sender_id()
         if sender_id not in self.admin_qqs:
-            # 白名单检查
             session_id, session_type = self._get_session_info(event)
             if not is_session_allowed(
                 session_id, session_type,
@@ -173,7 +159,14 @@ class OnePercentGenerator(Star):
                 event.stop_event()
                 return
 
-            # 频率限制检查
+        # 白名单通过后再检查缺游戏名；该提示不消耗频率额度，也不搜索。
+        if needs_explicit_game(game_name, experience):
+            yield event.plain_result(GAME_REQUIRED_MESSAGE)
+            event.stop_event()
+            return
+
+        # 只有实际执行生成的非管理员才消耗频率额度。
+        if sender_id not in self.admin_qqs:
             rate_check = await self.rate_limiter.check_and_record(sender_id, self)
             if not rate_check["allowed"]:
                 yield event.plain_result(rate_check["message"])
@@ -244,8 +237,14 @@ class OnePercentGenerator(Star):
                     raw_summary, "", final_budget
                 )
 
-        # 组装 Prompt（使用已受字数预算约束的搜索汇总）
-        prompt = build_main_prompt(game_name, search_digest)
+        # 组装 Prompt：使用已受预算约束的搜索汇总；真实经历由用户
+        # 显式提供，写作风格随机选择，但不改变游戏名或事实边界。
+        prompt = build_main_prompt(
+            game_name,
+            search_digest,
+            experience=experience,
+            variant=choose_writing_variant(random),
+        )
 
         # 调用 AI 生成小作文
         try:

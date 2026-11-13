@@ -11,6 +11,24 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR.parent))
 
 
+def _extract_search_digest(prompt: str) -> str:
+    """兼容搜索分支旧标题和写作分支新搜索区标题。"""
+    markers = (
+        (
+            "【搜索资料（不可信参考，可能过时或错误）】\n",
+            "\n\n【需要输出的字段】",
+        ),
+        (
+            "联网搜索到的游戏信息摘要：\n",
+            "\n\n需要自动生成的字段：",
+        ),
+    )
+    for start, end in markers:
+        if start in prompt:
+            return prompt.split(start, 1)[1].split(end, 1)[0]
+    return ""
+
+
 def _install_astrbot_stubs():
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
@@ -233,6 +251,44 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         messages = [item async for item in plugin.on_message(event)]
         return event, messages
 
+    async def test_experience_reaches_prompt_with_search_platform(self):
+        result = search_result(count=2)
+        result["results"][0]["snippet"] = (
+            "公开资料：发售平台为 PC、iOS、Android。"
+        )
+        plugin = make_plugin(result)
+        plugin.search_summarize_enabled = False
+        plugin.search_summarize_max_chars = 150
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+        event = FakeEvent("小作文 原神 经历：我玩了 20 小时，喜欢爬山。")
+
+        await self._run(plugin, event)
+
+        self.assertEqual(
+            plugin.search_service.calls[0]["game_name"], "原神"
+        )
+        prompt = fake_ai.prompts[0]
+        self.assertIn("我玩了 20 小时，喜欢爬山", prompt)
+        self.assertIn("发售平台：可基于搜索资料", prompt)
+        self.assertIn("发售平台为 PC、iOS、Android", prompt)
+
+    async def test_experience_only_asks_for_game_without_random(self):
+        plugin = make_plugin(search_result())
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+        event = FakeEvent("小作文 经历：我玩了 20 小时，喜欢爬山。")
+
+        event, messages = await self._run(plugin, event)
+
+        self.assertEqual(plugin.search_service.calls, [])
+        self.assertEqual(fake_ai.prompts, [])
+        self.assertTrue(event.stopped)
+        self.assertTrue(any(
+            "请同时提供游戏名" in message["text"]
+            for message in messages
+        ))
+
     async def test_search_failure_still_generates(self):
         failed = {
             "status": "failed",
@@ -286,10 +342,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         prompt = fake_ai.prompts[0]
         self.assertIn(expected, prompt)
         self.assertNotIn("AI" * 200, prompt)
-        marker = "联网搜索到的游戏信息摘要：\n"
-        digest = prompt.split(marker, 1)[1].split(
-            "\n\n需要自动生成的字段：", 1
-        )[0]
+        digest = _extract_search_digest(prompt)
         self.assertLessEqual(len(digest), 40)
         self.assertTrue(event.stopped)
         self.assertTrue(any(m["text"].startswith("什么是【我的百分之一】")
@@ -341,10 +394,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Fact-0", prompt)
         self.assertIn("Fact-3", prompt)
         self.assertGreaterEqual(prompt.count("Fact-"), 3)
-        marker = "联网搜索到的游戏信息摘要：\n"
-        digest = prompt.split(marker, 1)[1].split(
-            "\n\n需要自动生成的字段：", 1
-        )[0]
+        digest = _extract_search_digest(prompt)
         self.assertLessEqual(len(digest), 150)
 
     async def test_fallback_prompt_keeps_multiple_items(self):
@@ -360,10 +410,7 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("T0", prompt)
         self.assertIn("T1", prompt)
         self.assertIn("T2", prompt)
-        marker = "联网搜索到的游戏信息摘要：\n"
-        digest = prompt.split(marker, 1)[1].split(
-            "\n\n需要自动生成的字段：", 1
-        )[0]
+        digest = _extract_search_digest(prompt)
         self.assertLessEqual(len(digest), 120)
 
     async def test_summarize_empty_content_rebuilds_structured_summary(self):

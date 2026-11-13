@@ -17,9 +17,10 @@
 QQ 消息
   → 关键词匹配
   → 管理员/白名单校验
+  → 校验可选经历与游戏名称
   → 用户频率限制
   → 选择或读取游戏名称
-  → Bing 与百度并发搜索
+  → 按配置调用 AstrBot、搜索 API 或网页搜索
   → 可选的 AI 搜索摘要
   → 生成推荐帖正文
   → 清理模型误输出的标题和游戏名称
@@ -34,8 +35,8 @@ QQ 消息
 | --- | --- |
 | `main.py` | 插件注册、配置加载、事件处理和整体流程编排 |
 | `ai_client.py` | AI 请求、响应解析、错误分类、连接复用及资源释放 |
-| `search_service.py` | Bing/百度并发搜索、HTML 文本提取和结果合并 |
-| `prompt.py` | 系统提示词及正文提示词组装 |
+| `search_service.py` | 搜索后端调度、超时、结果提取与合并 |
+| `prompt.py` | 经历输入解析、写作风格与提示词组装 |
 | `post_process.py` | 清理模型输出并拼装活动说明与最终正文 |
 | `rate_limiter.py` | 基于 QQ 号的窗口计数和每日计数 |
 | `whitelist.py` | 群聊及私聊白名单判断 |
@@ -53,11 +54,13 @@ QQ 消息
 
 ### 搜索配置
 
-- `search_config.enabled`：是否启用联网搜索。
-- `search_config.timeout_ms`：单次 HTTP 请求超时。
+- `search_config.enabled`：旧搜索开关，关闭时强制关闭所有搜索。
+- `search_config.mode`：`auto`、`astrbot`、`api`、`web` 或 `off`；手动模式可通过 `fallback_enabled` 允许向后降级。
+- `search_config.api_provider`、`api_key`、`api_base_url`：独立搜索 API 的配置，目前支持 Tavily。
+- `search_config.timeout_ms`：所有后端共享的搜索总时间预算；`per_backend_timeout_ms` 控制单后端上限。
 - `search_config.result_count`：每个搜索源采用的结果数，运行时限制为 1–10。
 - `search_config.summarize_enabled`：是否调用 AI 整理搜索结果。
-- `search_config.summarize_max_chars`：搜索摘要的目标字数。
+- `search_config.summarize_max_chars`：进入生成 Prompt 的摘要最大字数；`summary_input_max_chars` 限制 AI 汇总输入。
 
 ### 权限及限流配置
 
@@ -95,7 +98,7 @@ Responses 的 `input_tokens` 和 `output_tokens` 会分别归一化为 `prompt_t
 
 ### 搜索服务
 
-Bing 和百度同时请求。单个来源失败不会中断另一个来源；所有来源失败时返回空摘要，正文生成使用模型自身知识继续执行。
+自动模式按已验证的 AstrBot 搜索工具、已配置的 Tavily API、网页搜索的顺序尝试；手动模式默认不降级。网页搜索并发请求 Bing 和百度，单源失败不阻止另一来源返回结果。全部来源失败时返回空摘要，正文生成仍可继续。
 
 搜索页 HTML 结构可能变化，因此解析失败必须被视为可恢复故障。
 
@@ -103,7 +106,7 @@ Bing 和百度同时请求。单个来源失败不会中断另一个来源；所
 
 频率限制数据使用 `rate_limit:<qq_id>` 作为 AstrBot KV 键，保存窗口起点、窗口计数、当天日期和每日计数。
 
-`AIClient` 与 `SearchService` 各自复用一个 `httpx.AsyncClient`。插件卸载时由 `terminate()` 关闭客户端。
+`AIClient` 与搜索后端按需复用 HTTP 客户端。插件卸载时由 `terminate()` 关闭客户端并等待有界的搜索清理；不合作的第三方协程可能无法立即终止。
 
 ## 7. 错误处理
 
@@ -126,7 +129,8 @@ GitHub Actions 在 Python 3.10 和 3.12 上执行语法检查与单元测试。�
 
 ## 9. 已知约束
 
-- 搜索依赖公开网页结构，不能保证长期稳定。
+- 网页搜索依赖公开网页结构，不能保证长期稳定；AstrBot 搜索适配目前仅覆盖 4.29.4 内置 Tavily 工具。
+- 提示词要求模型区分用户提供的经历与公开资料，但不能保证所有模型输出均准确，发布前需要核对。
 - KV 计数采用读取后写回方式，不提供跨进程原子性。
 - 当前窗口算法为固定窗口计数，并非逐请求淘汰的严格滑动窗口。
 - 请求在进入外部调用前计数，因此后续生成失败仍会占用额度。
