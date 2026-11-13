@@ -9,6 +9,8 @@
 - 新增 OpenAI Responses API（`/responses`）请求与响应解析
 - Responses API 的 `input_tokens` / `output_tokens` 自动映射到统一统计字段
 - 新增「发送 temperature 参数」配置，默认开启；关闭后两种 API 格式均不发送该参数
+- 新增 AstrBot、Tavily API 和网页搜索模式，可配置自动顺序、手动降级和超时预算
+- 支持为指定游戏提供真实游玩经历，并提供多种写作结构
 
 ### 修复
 
