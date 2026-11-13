@@ -74,15 +74,50 @@
     "type": "object",
     "items": {
       "enabled": {
-        "description": "是否启用联网搜索",
+        "description": "是否启用联网搜索（旧开关）",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "兼容旧配置。false 会强制关闭搜索（off），优先于 mode；不要与 mode=off 同时误用。"
+      },
+      "mode": {
+        "description": "搜索模式",
+        "type": "string",
+        "options": ["auto", "astrbot", "api", "web", "off"],
+        "labels": ["自动（AstrBot → API → 网页）", "仅 AstrBot", "仅搜索 API", "仅网页搜索", "关闭"],
+        "default": "auto",
+        "hint": "auto 按已验证的 AstrBot 搜索、已配置 API、网页搜索顺序尝试；手动模式默认不降级。"
+      },
+      "fallback_enabled": {
+        "description": "手动模式允许降级",
+        "type": "bool",
+        "default": false,
+        "hint": "仅对 astrbot/api/web 手动模式生效。开启后按 auto 顺序继续尝试后续后端；auto 始终按顺序降级。"
+      },
+      "api_provider": {
+        "description": "搜索 API 提供商",
+        "type": "string",
+        "options": ["tavily"],
+        "labels": ["Tavily"],
+        "default": "tavily",
+        "hint": "当前仅验证 Tavily。未配置有效 Key 时不会调用 API。"
+      },
+      "api_key": {
+        "description": "搜索 API Key",
+        "type": "string",
+        "hint": "Tavily API Key（tvly-...）。留空时跳过 API 后端，不发起请求。",
+        "obvious_hint": true
+      },
+      "api_base_url": {
+        "description": "搜索 API Base URL",
+        "type": "string",
+        "default": "https://api.tavily.com",
+        "hint": "Tavily 官方地址。固定使用 basic 搜索（1 credit/次），不自动重试。"
       },
       "result_count": {
         "description": "采用搜索结果条数",
         "type": "int",
         "default": 3,
-        "hint": "搜索后采用多少条搜索结果的信息（1-10）"
+        "hint": "统一结果与每个网页搜索源采用的条数（1-10）"
       },
       "summarize_enabled": {
         "description": "是否启用搜索汇总",
@@ -94,12 +129,25 @@
         "description": "搜索汇文字数限制",
         "type": "int",
         "default": 150,
-        "hint": "AI 生成的搜索汇总文章的最大字数（50-500）"
+        "hint": "AI 生成或回退的搜索汇总最大字数（50-500），实际进入生成 Prompt 前强制截断"
       },
       "timeout_ms": {
-        "description": "搜索超时时间（毫秒）",
+        "description": "搜索总时间预算（毫秒）",
         "type": "int",
-        "default": 8000
+        "default": 8000,
+        "hint": "整个搜索流程的总预算，所有后端共享，不会各自累加超时"
+      },
+      "per_backend_timeout_ms": {
+        "description": "单后端超时上限（毫秒）",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示按剩余预算和候选数自动分配；大于 0 时每个后端最多使用该时长，避免第一个后端耗尽全部预算"
+      },
+      "summary_input_max_chars": {
+        "description": "AI 汇总输入最大字数",
+        "type": "int",
+        "default": 6000,
+        "hint": "进入 AI 搜索汇总前的总字数预算；单条标题/摘要另有固定上限，长结果不会挤掉后续条目"
       }
     }
   },
