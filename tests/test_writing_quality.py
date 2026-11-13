@@ -12,10 +12,12 @@ from astrbot_plugin_onepercent_generator.post_process import (  # noqa: E402
     strip_generated_title_and_game_name,
 )
 from astrbot_plugin_onepercent_generator.prompt import (  # noqa: E402
+    GAME_REQUIRED_MESSAGE,
     MAX_EXPERIENCE_CHARS,
     WRITING_VARIANTS,
     build_main_prompt,
     choose_writing_variant,
+    needs_explicit_game,
     parse_writing_request,
 )
 
@@ -82,6 +84,18 @@ class WritingRequestParsingTests(unittest.TestCase):
         self.assertEqual(game_name, "原神")
         self.assertEqual(parsed, experience)
 
+    def test_experience_only_requires_explicit_game(self):
+        matched, game_name, experience = parse_writing_request(
+            "小作文 经历：我玩了 20 小时"
+        )
+        self.assertTrue(matched)
+        self.assertEqual(game_name, "")
+        self.assertEqual(experience, "我玩了 20 小时")
+        self.assertTrue(needs_explicit_game(game_name, experience))
+        self.assertFalse(needs_explicit_game("原神", experience))
+        self.assertFalse(needs_explicit_game("", ""))
+        self.assertIn("请同时提供游戏名", GAME_REQUIRED_MESSAGE)
+
     def test_experience_length_is_bounded(self):
         long_experience = "经" * (MAX_EXPERIENCE_CHARS + 100)
         _, _, parsed = parse_writing_request(
@@ -116,9 +130,22 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertIn(experience, prompt)
         self.assertIn("只能使用上述经历中明确出现", prompt)
         self.assertIn("不得新增具体游玩时长", prompt)
-        self.assertIn("搜索资料只用于游戏客观信息", prompt)
+        self.assertIn("搜索资料可以用于发售平台等客观游戏信息", prompt)
         self.assertIn("不得覆盖或扩写用户经历", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
+
+    def test_experience_prompt_allows_objective_platform_from_search(self):
+        prompt = build_main_prompt(
+            "原神",
+            "公开资料：发售平台为 PC、iOS、Android、PS5。",
+            experience="我玩了 20 小时，喜欢在璃月爬山。",
+            variant="warm",
+        )
+
+        self.assertIn("发售平台：可基于搜索资料", prompt)
+        self.assertIn("不得把搜索资料写成个人经历", prompt)
+        self.assertNotIn("发售平台：只写经历", prompt)
+        self.assertIn("发售平台为 PC、iOS、Android、PS5", prompt)
 
     def test_no_experience_prompt_forbids_first_person_fabrication(self):
         prompt = build_main_prompt(

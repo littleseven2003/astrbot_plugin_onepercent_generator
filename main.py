@@ -12,8 +12,10 @@ from astrbot.api.star import Context, Star, register
 from .ai_client import AIClient, AIClientError
 from .post_process import build_final_message
 from .prompt import (
+    GAME_REQUIRED_MESSAGE,
     build_main_prompt,
     choose_writing_variant,
+    needs_explicit_game,
     parse_writing_request,
 )
 from .rate_limiter import RateLimiter
@@ -117,6 +119,13 @@ class OnePercentGenerator(Star):
         matched, game_name, experience = parse_writing_request(text)
 
         if not matched:
+            return
+
+        # 只提供经历、没有游戏名时，不能随机换成另一个游戏；先请用户
+        # 补齐游戏名，避免把经历挂到无关游戏上。
+        if needs_explicit_game(game_name, experience):
+            yield event.plain_result(GAME_REQUIRED_MESSAGE)
+            event.stop_event()
             return
 
         # 管理员不受白名单限制

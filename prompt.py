@@ -15,6 +15,9 @@ TRIGGERS = ("小作文", "我的百分之一")
 EXPERIENCE_MARKERS = ("经历：", "经历:")
 
 DEFAULT_WRITING_VARIANT = "warm"
+GAME_REQUIRED_MESSAGE = (
+    "请同时提供游戏名，例如：小作文 原神 经历：我玩了 20 小时。"
+)
 
 # 少量可观察的结构/语气变化。所有变体都不得改变游戏名，也不得突破
 # 下面的事实边界。
@@ -118,6 +121,11 @@ def parse_writing_request(text: str) -> tuple[bool, str, str]:
     return False, "", ""
 
 
+def needs_explicit_game(game_name: str, experience: str) -> bool:
+    """只提供经历、没有游戏名时不能随机换成另一个游戏。"""
+    return bool(str(experience or "").strip() and not str(game_name or "").strip())
+
+
 def choose_writing_variant(rng=None) -> str:
     """选择写作变体；传入 random.Random(seed) 可在测试中固定。"""
     choices = tuple(WRITING_VARIANTS)
@@ -151,10 +159,10 @@ def _experience_section(experience: str) -> tuple[str, str, str]:
         boundaries = """【事实边界】
 - 只能使用上述经历中明确出现的时间、事件、人物、感受和细节；没有出现的信息一律不要补造。
 - 不得新增具体游玩时长、某天发生的事、个人心理活动或主观评价。
-- 搜索资料只用于游戏客观信息，不得当作你的个人经历，也不得覆盖或扩写用户经历。
+- 搜索资料可以用于发售平台等客观游戏信息，但不得当作你的个人经历，也不得覆盖或扩写用户经历。
 - 经历没有提到的字段写“未提供”或“待补充”，不要猜测。"""
         fields = """【需要输出的字段】
-发售平台：只写经历中明确出现的平台；未出现写“未提供”。
+发售平台：可基于搜索资料中明确的客观平台信息；不确定写“资料未提供”，不得把搜索资料写成个人经历。
 游玩时间：只写经历中明确出现的时长或时间；未出现写“未提供”。
 推荐人群：只基于经历明确信息和游戏客观类型；不确定写“待补充”。
 个人故事/推荐理由：只能重组经历中明确出现的事实和感受，不新增细节。"""
