@@ -90,83 +90,97 @@ def _canonical_field(label: str) -> str:
     label = label.strip()
     if "发售平台" in label:
         return "发售平台"
-    if "游玩时间" in label:
+    if any(
+        key in label
+        for key in ("游玩时间", "玩游戏的时间", "游戏时间", "游玩时长")
+    ):
         return "游玩时间"
     if "推荐" in label:
         return "推荐人群及理由"
     if "游戏介绍" in label:
         return "游戏介绍"
-    if "故事" in label or "感想" in label:
+    if any(key in label for key in ("故事", "感想", "心得")):
         return "故事/感想"
     return label
 
 
+def _parse_field_line(line: str) -> tuple[str, str] | None:
+    """解析普通/Markdown 加粗字段行，识别活动原文等价写法。"""
+    raw = line.strip()
+    raw = re.sub(r"^[*_\s]+", "", raw)
+    match = re.match(r"^([^：:]{1,32}?)\s*[：:]\s*(.*)$", raw)
+    if not match:
+        return None
+    label = re.sub(r"[*_\s]+$", "", match.group(1)).strip()
+    value = match.group(2).strip()
+    value = re.sub(r"^[*_\s]+", "", value)
+    value = re.sub(r"[*_\s]+$", "", value)
+    canonical = _canonical_field(label)
+    if canonical not in FIELD_ORDER:
+        return None
+    return canonical, value
+
+
 def _is_placeholder(value: str) -> bool:
-    normalized = value.strip().strip("。；;,.，")
+    normalized = value.strip()
+    normalized = re.sub(r"^[*_\s]+|[*_\s]+$", "", normalized)
+    normalized = normalized.strip().strip("。；;,.，")
     if not normalized:
         return True
     low = normalized.lower()
     if low in _PLACEHOLDER_VALUES:
         return True
     return (
-        normalized.startswith("资料未提供")
+        normalized.startswith("未提供")
+        or normalized.startswith("资料未提供")
         or normalized.startswith("用户未提供")
         or normalized.startswith("用户未填写")
         or normalized.startswith("待补充")
+        or normalized.startswith("暂无")
     )
 
 
 def prepare_article_body(
     ai_body: str, has_experience: bool = False
 ) -> tuple[str, list[str]]:
-    """清理正文占位值，并返回正文外需要用户补充的字段。
+    """清理正文占位值，并返回明确的空字段。
 
-    - 占位值不进入正文；
-    - 未提供个人经历时，删除“故事/感想”字段及其后续段落；
-    - 缺失字段只在正文外提示，不伪造内容。
+    设计原则：
+    - 只有识别到字段且值为空/占位时才报告缺失；
+    - 自然段文章没有字段标题，不据此断言缺少游戏介绍或故事；
+    - 未提供经历时，删除带“故事/感想”标题的段落，不删除普通自然段；
+    - Markdown 加粗、空白和中英文冒号均可识别；
+    - “游戏当时发售平台”“玩游戏的时间”等活动原文写法可识别。
     """
     body = strip_generated_title_and_game_name(ai_body or "")
     lines = body.splitlines()
     cleaned: list[str] = []
     missing: list[str] = []
-    seen: set[str] = set()
     skip_story = False
 
     for line in lines:
-        match = _FIELD_RE.match(line)
-        if match:
-            raw_label, value = match.group(1), match.group(2)
-            canonical = _canonical_field(raw_label)
+        parsed = _parse_field_line(line)
+        if parsed is not None:
+            canonical, value = parsed
             if canonical == "故事/感想" and not has_experience:
                 skip_story = True
                 if canonical not in missing:
                     missing.append(canonical)
                 continue
-            if canonical in FIELD_ORDER:
-                skip_story = False
-                seen.add(canonical)
-            if skip_story:
-                continue
+            skip_story = False
             if _is_placeholder(value):
-                if canonical in FIELD_ORDER and canonical not in missing:
+                if canonical not in missing:
                     missing.append(canonical)
                 continue
-            cleaned.append(line.rstrip())
+            cleaned.append(f"{canonical}：{value}")
             continue
 
         if skip_story:
+            if not line.strip():
+                skip_story = False
+                cleaned.append("")
             continue
         cleaned.append(line.rstrip())
-
-    if not has_experience and "故事/感想" not in missing:
-        missing.append("故事/感想")
-
-    for label in FIELD_ORDER:
-        if label == "故事/感想" and not has_experience:
-            if label not in missing:
-                missing.append(label)
-        elif label not in seen and label not in missing:
-            missing.append(label)
 
     ordered_missing = [label for label in FIELD_ORDER if label in missing]
     body = "\n".join(cleaned).strip()
@@ -206,7 +220,10 @@ def build_final_message(
 
     notes: list[str] = []
     if missing:
-        notes.append("正文暂缺（不属于正文）：" + "、".join(missing))
+        notes.append(
+            "生成结果中以下字段为空（不属于正文）："
+            + "、".join(missing)
+        )
     if not has_experience:
         notes.append(
             "未提供个人经历。客观介绍不能替代个人故事，"

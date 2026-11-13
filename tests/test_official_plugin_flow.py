@@ -208,8 +208,9 @@ class OfficialPluginFlowTests(unittest.IsolatedAsyncioTestCase):
         body = final.split("---", 1)[0]
 
         self.assertNotIn("故事/感想", body)
+        self.assertNotIn("生成结果中以下字段为空", final)
         self.assertIn("未提供个人经历", final)
-        self.assertIn("故事/感想", final)
+        self.assertIn("补充方式：小作文 原神 经历", final)
 
     async def test_qq_admin_openid_can_be_configured_without_numeric_id(self):
         umo = "qq_official_bot:FriendMessage:openid-admin"

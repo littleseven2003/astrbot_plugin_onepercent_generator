@@ -135,6 +135,10 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
         self.assertIn("正文约 500-800 个中文字", prompt)
         self.assertIn("不要输出“未提供”", prompt)
+        self.assertNotIn("写“未提供”", prompt)
+        self.assertNotIn("写“待补充”", prompt)
+        self.assertNotIn("不要输出段落标签", prompt)
+        self.assertIn("字段名可选用", prompt)
 
     def test_experience_prompt_allows_objective_platform_from_search(self):
         prompt = build_main_prompt(
@@ -161,6 +165,8 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertIn("改写客观推荐理由", prompt)
         self.assertIn("用户未提供，省略这一节", prompt)
         self.assertIn("正文约 500-800 个中文字", prompt)
+        self.assertNotIn("写“资料未提供”", prompt)
+        self.assertNotIn("写“待补充”", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
         self.assertNotIn("根据你对该游戏的了解自然生成", prompt)
 

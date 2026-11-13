@@ -186,6 +186,9 @@ def make_plugin(
     result=None,
     whitelist_mode="legacy",
     whitelist_umos=None,
+    omit_mode=False,
+    omit_umos=False,
+    umos_explicit_null=False,
 ):
     config = {
         "ai_config": {
@@ -208,11 +211,17 @@ def make_plugin(
         "admin_qqs": admin_qqs or [],
         "preset_games": ["测试游戏"],
         "whitelist_mode": whitelist_mode,
-        "whitelist_umos": whitelist_umos or [],
+        "whitelist_umos": (
+            None if umos_explicit_null else (whitelist_umos or [])
+        ),
         "whitelist_groups": [],
         "whitelist_privates": whitelist_privates or [],
         "show_generation_stats": False,
     }
+    if omit_mode:
+        config.pop("whitelist_mode", None)
+    if omit_umos:
+        config.pop("whitelist_umos", None)
     plugin = OnePercentGenerator(FakeContext(), config)
     plugin.search_service = FakeSearchService(result or search_result())
     plugin.rate_limiter = FakeRateLimiter()
@@ -312,6 +321,77 @@ class WritingMainFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin._is_admin(event))
         self.assertEqual(plugin.search_service.calls, ["原神"])
         self.assertEqual(plugin.rate_limiter.calls, ["openid-2"])
+
+    async def test_invalid_mode_is_rejected_instead_of_legacy_fallback(self):
+        plugin = make_plugin(
+            whitelist_mode="um0",
+            whitelist_umos=["qq_bot:FriendMessage:allowed"],
+        )
+        event = FakeEvent("openid", "小作文 原神", umo="other")
+
+        messages = await self._run(plugin, event)
+
+        self.assertTrue(event.stopped)
+        self.assertIn("白名单模式配置无效", messages[0]["text"])
+        self.assertEqual(plugin.rate_limiter.calls, [])
+        self.assertEqual(plugin.search_service.calls, [])
+
+    async def test_explicit_null_mode_is_rejected(self):
+        plugin = make_plugin(
+            whitelist_mode=None,
+            whitelist_umos=["qq_bot:FriendMessage:allowed"],
+        )
+        event = FakeEvent("openid", "小作文 原神", umo="other")
+
+        messages = await self._run(plugin, event)
+
+        self.assertIn("白名单模式配置无效", messages[0]["text"])
+        self.assertEqual(plugin.search_service.calls, [])
+
+    async def test_explicit_null_umos_is_rejected_in_umo_mode(self):
+        plugin = make_plugin(
+            whitelist_mode="umo",
+            whitelist_umos=None,
+            umos_explicit_null=True,
+        )
+        event = FakeEvent("openid", "小作文 原神", umo="other")
+
+        messages = await self._run(plugin, event)
+
+        self.assertIn("UMO 白名单配置无效", messages[0]["text"])
+        self.assertEqual(plugin.search_service.calls, [])
+
+    async def test_missing_mode_keeps_legacy_empty_list_behavior(self):
+        plugin = make_plugin(omit_mode=True, omit_umos=True)
+        event = FakeEvent("openid", "小作文 原神", umo="other")
+
+        await self._run(plugin, event)
+
+        self.assertEqual(plugin.search_service.calls, ["原神"])
+
+    async def test_legacy_mode_ignores_restrictive_umo_list(self):
+        plugin = make_plugin(
+            whitelist_mode="legacy",
+            whitelist_umos=["qq_bot:FriendMessage:allowed"],
+        )
+        event = FakeEvent("openid", "小作文 原神", umo="other")
+
+        await self._run(plugin, event)
+
+        self.assertEqual(plugin.search_service.calls, ["原神"])
+
+    async def test_admin_bypasses_invalid_whitelist_config(self):
+        plugin = make_plugin(
+            admin_qqs=["admin-openid"],
+            whitelist_mode="um0",
+            whitelist_umos=["qq_bot:FriendMessage:allowed"],
+        )
+        event = FakeEvent("admin-openid", "小作文 原神", umo="other")
+
+        await self._run(plugin, event)
+
+        self.assertEqual(plugin.search_service.calls, ["原神"])
+        self.assertEqual(plugin.rate_limiter.calls, [])
 
     async def test_non_whitelist_experience_only_is_rejected_first(self):
         plugin = make_plugin(whitelist_privates=["allowed"])

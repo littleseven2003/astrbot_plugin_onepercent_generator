@@ -29,7 +29,7 @@ from .search_service import (
     prepare_search_digest,
     search_outcome_label,
 )
-from .whitelist import is_session_allowed
+from .whitelist import is_session_allowed, validate_whitelist_config
 
 
 @register(
@@ -100,9 +100,25 @@ class OnePercentGenerator(Star):
             "原神", "星露谷物语", "艾尔登法环", "塞尔达传说：王国之泪", "博德之门3",
         ])
 
-        # 白名单：legacy 与 UMO 二选一，不做新旧 OR。
-        self.whitelist_mode = self.config.get("whitelist_mode", "legacy")
+        # 白名单：legacy 与 UMO 二选一，不做新旧 OR。缺失 mode 按
+        # legacy 兼容；显式 null/未知 mode 或非法 UMO 列表拒绝。
+        self.whitelist_mode_configured = "whitelist_mode" in self.config
+        self.whitelist_umos_configured = "whitelist_umos" in self.config
+        self.whitelist_mode = self.config.get(
+            "whitelist_mode", "legacy"
+        )
         self.whitelist_umos = self.config.get("whitelist_umos", [])
+        self.whitelist_config_error = validate_whitelist_config(
+            self.whitelist_mode,
+            self.whitelist_mode_configured,
+            self.whitelist_umos,
+            self.whitelist_umos_configured,
+        )
+        if self.whitelist_config_error:
+            logger.warning(
+                "[小作文生成器] 白名单配置无效: %s",
+                self.whitelist_config_error,
+            )
         self.whitelist_groups = self.config.get("whitelist_groups", [])
         self.whitelist_privates = self.config.get("whitelist_privates", [])
 
@@ -164,6 +180,20 @@ class OnePercentGenerator(Star):
         # 管理员不受白名单限制；非白名单用户沿用原有拒绝策略。
         sender_id = event.get_sender_id()
         if sender_id not in self.admin_qqs:
+            if self.whitelist_config_error:
+                if self.whitelist_config_error == "invalid_whitelist_mode":
+                    message = (
+                        "⚠️ 白名单模式配置无效（whitelist_mode "
+                        "应为 legacy 或 umo），已拒绝本次请求。"
+                    )
+                else:
+                    message = (
+                        "⚠️ UMO 白名单配置无效（whitelist_umos "
+                        "应为列表），已拒绝本次请求。"
+                    )
+                yield event.plain_result(message)
+                event.stop_event()
+                return
             session_id, session_type = self._get_session_info(event)
             if not is_session_allowed(
                 session_id, session_type,
