@@ -233,6 +233,46 @@ class MainPipelineTests(unittest.IsolatedAsyncioTestCase):
         messages = [item async for item in plugin.on_message(event)]
         return event, messages
 
+    async def test_search_failure_still_generates(self):
+        failed = {
+            "status": "failed",
+            "summary": "",
+            "provider": "失败",
+            "duration_ms": 1,
+            "results": [],
+            "effective_backend": "",
+            "failure_reason": "timeout",
+        }
+        plugin = make_plugin(failed)
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        event, messages = await self._run(plugin)
+
+        self.assertEqual(len(fake_ai.prompts), 1)
+        self.assertTrue(event.stopped)
+        self.assertTrue(messages)
+
+    async def test_search_disabled_still_generates(self):
+        disabled = {
+            "status": "disabled",
+            "summary": "",
+            "provider": "未启用",
+            "duration_ms": 0,
+            "results": [],
+            "effective_backend": "",
+            "failure_reason": "disabled",
+        }
+        plugin = make_plugin(disabled)
+        fake_ai = FakeAIClient(summarize_text="")
+        plugin.ai_client = fake_ai
+
+        event, messages = await self._run(plugin)
+
+        self.assertEqual(len(fake_ai.prompts), 1)
+        self.assertTrue(event.stopped)
+        self.assertTrue(messages)
+
     async def test_summary_budget_applied_to_generate_prompt(self):
         plugin = make_plugin(search_result())
         fake_ai = FakeAIClient(summarize_text="AI" * 200)
