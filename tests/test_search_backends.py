@@ -803,6 +803,13 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '</div><div class="c-abstract">Parent Sibling Summary</div>'
         '</div></body></html>'
     )
+    BAIDU_INLINE_SUMMARY_LINK = (
+        '<html><body><div class="result"><h3>'
+        '<a href="https://example.com/a">Title A</a></h3>'
+        '<div class="c-container"><div class="c-abstract">'
+        'Intro <a href="https://example.com/extra">details</a> and facts.'
+        '</div></div></div></body></html>'
+    )
     BAIDU_WRAPPED_SUMMARY = (
         '<html><body><div class="result c-container"><h3>'
         '<a href="https://example.com/wrapped">Wrapped A</a></h3>'
@@ -1488,6 +1495,11 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             (self.BAIDU_CONTAINER_ONLY, ["Container Only"], "Container Snippet"),
             (self.BAIDU_RESULT_ONLY, ["Result Only"], "Result Snippet"),
             (self.BAIDU_OK, ["Baidu Title"], "Baidu Snippet"),
+            (
+                self.BAIDU_INLINE_SUMMARY_LINK,
+                ["Title A"],
+                "Intro details and facts.",
+            ),
             (self.BAIDU_WRAPPED_SUMMARY, ["Wrapped A"], "Summary A"),
             (self.BAIDU_SELF_ABSTRACT, ["Self Abstract"], "Self Summary"),
             (

@@ -1046,7 +1046,10 @@ class _BaiduResultParser(HTMLParser):
             frame.h3_depth += 1
             return
         if tag == "a":
-            frame.anchor_seen = True
+            # 摘要正文中的内联链接是内容，不代表新的独立结果；只有
+            # 标题区之外、摘要区之外的锚点才参与“无效标题”判断。
+            if not frame.in_snippet and frame.h3_depth == 0:
+                frame.anchor_seen = True
         if (
             tag == "a"
             and frame.h3_depth > 0
