@@ -934,6 +934,9 @@ class _BaiduResultFrame:
         self.url = ""
         self.h3_depth = 0
         self.h3_seen = False
+        self.anchor_seen = False
+        self.later_h3_after_title = False
+        self.ambiguous_child = False
         self.titled_children: list[dict] = []
         self.in_snippet = False
         self.snippet_tag: str | None = None
@@ -1000,9 +1003,11 @@ class _BaiduResultParser(HTMLParser):
                 parent.titled_children.append(entry)
             return
 
-        # 出现过 h3 却没有有效标题：这是一个“标题不可用的独立结果”，
-        # 它的摘要不能上推给父结果，否则会把 B 的事实算到 A 头上。
-        if frame.h3_seen:
+        # 出现过 h3/链接却没有有效标题，或内部有标题不可用的子结果：
+        # 这是标题不可用的独立结果或歧义包装，摘要不能上推/补给父结果。
+        if frame.h3_seen or frame.anchor_seen or frame.ambiguous_child:
+            if parent is not None:
+                parent.ambiguous_child = True
             return
 
         if frame.titled_children:
@@ -1035,9 +1040,13 @@ class _BaiduResultParser(HTMLParser):
             return
         frame = self.stack[-1]
         if tag == "h3":
+            if frame.title_anchor_seen:
+                frame.later_h3_after_title = True
             frame.h3_seen = True
             frame.h3_depth += 1
             return
+        if tag == "a":
+            frame.anchor_seen = True
         if (
             tag == "a"
             and frame.h3_depth > 0
@@ -1064,6 +1073,7 @@ class _BaiduResultParser(HTMLParser):
             ("c-abstract" in classes or "abstract" in classes)
             and not frame.in_snippet
             and not frame.snippet_found
+            and not frame.later_h3_after_title
         ):
             frame.in_snippet = True
             frame.snippet_tag = tag

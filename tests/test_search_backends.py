@@ -772,6 +772,23 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Ambiguous Summary</div>'
         '</div></body></html>'
     )
+    BAIDU_NESTED_INVALID_CHILD = (
+        '<html><body><div class="result"><h3>'
+        '<a href="https://example.com/parent-a">Parent A</a></h3>'
+        '<div class="result">'
+        '<div class="result"><h3>'
+        '<a href="javascript:;">Broken B</a></h3></div>'
+        '<div class="c-abstract">Nested B Summary</div>'
+        '</div></div></body></html>'
+    )
+    BAIDU_INVALID_B_WITHOUT_CONTAINER = (
+        '<html><body><div class="result"><h3>'
+        '<a href="https://example.com/parent-a">Parent A</a></h3>'
+        '<div class="sub"><h3>'
+        '<a href="">Broken B</a></h3>'
+        '<div class="c-abstract">B Summary</div></div>'
+        '</div></body></html>'
+    )
     BAIDU_TITLE_CHILD_SUMMARY_PARENT = (
         '<html><body><div class="result">'
         '<div class="result"><h3>'
@@ -1507,6 +1524,40 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             ["", ""],
         )
         self.assertNotIn("Ambiguous Summary", result.get("summary", ""))
+
+    async def test_baidu_nested_invalid_child_does_not_lift_summary(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(
+                200, text=self.BAIDU_NESTED_INVALID_CHILD
+            )
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Parent A"],
+        )
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertNotIn("Nested B Summary", result.get("summary", ""))
+
+    async def test_baidu_invalid_title_without_container_does_not_lift_summary(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(
+                200, text=self.BAIDU_INVALID_B_WITHOUT_CONTAINER
+            )
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Parent A"],
+        )
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertNotIn("B Summary", result.get("summary", ""))
 
     async def test_baidu_invalid_child_title_does_not_lift_summary(self):
         for href in ("", "javascript:;"):
