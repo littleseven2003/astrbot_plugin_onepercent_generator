@@ -781,6 +781,13 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         '<div class="c-abstract">Nested B Summary</div>'
         '</div></div></body></html>'
     )
+    BAIDU_INVALID_LINK_NO_H3 = (
+        '<html><body><div class="result"><h3>'
+        '<a href="https://example.com/parent-a">Parent A</a></h3>'
+        '<div class="result"><a href="">Broken B link</a>'
+        '<div class="c-abstract">No-H3 B Summary</div></div>'
+        '</div></body></html>'
+    )
     BAIDU_INVALID_B_WITHOUT_CONTAINER = (
         '<html><body><div class="result"><h3>'
         '<a href="https://example.com/parent-a">Parent A</a></h3>'
@@ -1541,6 +1548,21 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["results"][0]["snippet"], "")
         self.assertNotIn("Nested B Summary", result.get("summary", ""))
+
+    async def test_baidu_invalid_link_without_h3_does_not_lift_summary(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(429, text="rate limited")
+            return httpx.Response(200, text=self.BAIDU_INVALID_LINK_NO_H3)
+
+        result = await self._service(handler).search_game_info("游戏")
+
+        self.assertEqual(
+            [item["title"] for item in result["results"]],
+            ["Parent A"],
+        )
+        self.assertEqual(result["results"][0]["snippet"], "")
+        self.assertNotIn("No-H3 B Summary", result.get("summary", ""))
 
     async def test_baidu_invalid_title_without_container_does_not_lift_summary(self):
         async def handler(request):
