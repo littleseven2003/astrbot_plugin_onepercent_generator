@@ -400,7 +400,9 @@ class AIClient:
                 "model": str,
                 "api_format": str,
                 "duration_ms": int,
-                "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+                "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int},
+                "finish_reason": str,
+                "truncated": bool
             }
         """
         return await self._call_ai(
@@ -480,10 +482,24 @@ class AIClient:
             duration_ms = int((time.time() - start_time) * 1000)
 
             token_usage = self._extract_token_usage(data)
+            finish_reason = ""
+            truncated = False
+            if self.api_format == API_FORMAT_CHAT_COMPLETIONS:
+                choices = data.get("choices")
+                if isinstance(choices, list) and choices:
+                    choice = choices[0]
+                    if isinstance(choice, dict):
+                        raw_reason = choice.get("finish_reason")
+                        if isinstance(raw_reason, str):
+                            candidate = raw_reason.strip().lower()
+                            if candidate in {"stop", "length", "content_filter"}:
+                                finish_reason = candidate
+                                truncated = candidate == "length"
 
             logger.info(
                 f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符，"
-                f"耗时: {duration_ms}ms，tokens: {token_usage['total_tokens']}"
+                f"耗时: {duration_ms}ms，tokens: {token_usage['total_tokens']}，"
+                f"finish_reason: {finish_reason or 'unknown'}"
             )
             return {
                 "content": content,
@@ -491,6 +507,8 @@ class AIClient:
                 "api_format": self.api_format,
                 "duration_ms": duration_ms,
                 "token_usage": token_usage,
+                "finish_reason": finish_reason,
+                "truncated": truncated,
             }
 
         except httpx.TimeoutException:

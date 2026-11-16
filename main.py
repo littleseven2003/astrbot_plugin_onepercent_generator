@@ -10,8 +10,10 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .ai_client import AIClient, AIClientError
-from .post_process import build_final_message
+from .post_process import article_body_length, build_final_message
 from .prompt import (
+    ARTICLE_TARGET_MAX_CHARS,
+    ARTICLE_TARGET_MIN_CHARS,
     GAME_REQUIRED_MESSAGE,
     build_main_prompt,
     choose_writing_variant,
@@ -25,8 +27,9 @@ from .search_service import (
     build_search_summary,
     format_source_failures,
     prepare_search_digest,
+    search_outcome_label,
 )
-from .whitelist import is_session_allowed
+from .whitelist import is_session_allowed, validate_whitelist_config
 
 
 @register(
@@ -97,7 +100,25 @@ class OnePercentGenerator(Star):
             "原神", "星露谷物语", "艾尔登法环", "塞尔达传说：王国之泪", "博德之门3",
         ])
 
-        # 白名单
+        # 白名单：legacy 与 UMO 二选一，不做新旧 OR。缺失 mode 按
+        # legacy 兼容；显式 null/未知 mode 或非法 UMO 列表拒绝。
+        self.whitelist_mode_configured = "whitelist_mode" in self.config
+        self.whitelist_umos_configured = "whitelist_umos" in self.config
+        self.whitelist_mode = self.config.get(
+            "whitelist_mode", "legacy"
+        )
+        self.whitelist_umos = self.config.get("whitelist_umos", [])
+        self.whitelist_config_error = validate_whitelist_config(
+            self.whitelist_mode,
+            self.whitelist_mode_configured,
+            self.whitelist_umos,
+            self.whitelist_umos_configured,
+        )
+        if self.whitelist_config_error:
+            logger.warning(
+                "[小作文生成器] 白名单配置无效: %s",
+                self.whitelist_config_error,
+            )
         self.whitelist_groups = self.config.get("whitelist_groups", [])
         self.whitelist_privates = self.config.get("whitelist_privates", [])
 
@@ -122,6 +143,15 @@ class OnePercentGenerator(Star):
         if group_id:
             return group_id, "group"
         return event.get_sender_id(), "private"
+
+    @staticmethod
+    def _get_umo(event: AstrMessageEvent) -> str:
+        """安全读取统一消息来源；缺失/异常时返回空字符串。"""
+        try:
+            value = getattr(event, "unified_msg_origin", "")
+        except Exception:
+            return ""
+        return value if isinstance(value, str) else ""
 
     def _get_random_game(self) -> str:
         """从预设列表中随机选择游戏"""
@@ -150,10 +180,27 @@ class OnePercentGenerator(Star):
         # 管理员不受白名单限制；非白名单用户沿用原有拒绝策略。
         sender_id = event.get_sender_id()
         if sender_id not in self.admin_qqs:
+            if self.whitelist_config_error:
+                if self.whitelist_config_error == "invalid_whitelist_mode":
+                    message = (
+                        "⚠️ 白名单模式配置无效（whitelist_mode "
+                        "应为 legacy 或 umo），已拒绝本次请求。"
+                    )
+                else:
+                    message = (
+                        "⚠️ UMO 白名单配置无效（whitelist_umos "
+                        "应为列表），已拒绝本次请求。"
+                    )
+                yield event.plain_result(message)
+                event.stop_event()
+                return
             session_id, session_type = self._get_session_info(event)
             if not is_session_allowed(
                 session_id, session_type,
                 self.whitelist_groups, self.whitelist_privates,
+                mode=self.whitelist_mode,
+                umo=self._get_umo(event),
+                whitelist_umos=self.whitelist_umos,
             ):
                 yield event.plain_result("🚫 当前会话不在白名单中，无法使用小作文功能")
                 event.stop_event()
@@ -255,9 +302,33 @@ class OnePercentGenerator(Star):
             event.stop_event()
             return
 
-        # 后处理并返回小作文
+        # 后处理并返回可复制的小作文；不自动重试、不自动发布。
         ai_content = ai_result["content"]
-        final_message = build_final_message(game_name, ai_content)
+        warnings = []
+        if ai_result.get("truncated"):
+            warnings.append(
+                "模型输出达到长度上限，正文可能被截断；未自动发起付费重试。"
+            )
+        body_length = article_body_length(
+            ai_content, bool(experience.strip())
+        )
+        if body_length < ARTICLE_TARGET_MIN_CHARS:
+            warnings.append(
+                f"当前正文约 {body_length} 字，低于建议的 "
+                f"{ARTICLE_TARGET_MIN_CHARS}-{ARTICLE_TARGET_MAX_CHARS} 字目标；"
+                "未自动重试，可补充资料后重新生成。"
+            )
+        elif body_length > ARTICLE_TARGET_MAX_CHARS:
+            warnings.append(
+                f"当前正文约 {body_length} 字，超过建议的 "
+                f"{ARTICLE_TARGET_MIN_CHARS}-{ARTICLE_TARGET_MAX_CHARS} 字目标。"
+            )
+        final_message = build_final_message(
+            game_name,
+            ai_content,
+            experience=experience,
+            warnings=warnings,
+        )
         yield event.plain_result(final_message)
 
         # 组装生成信息
@@ -272,7 +343,23 @@ class OnePercentGenerator(Star):
             search_backend_label = BACKEND_LABELS.get(
                 search_backend, search_backend or "无"
             )
-            search_degraded = "是" if search_result.get("degraded") else "否"
+            search_status = search_result.get("status", "failed")
+            search_outcome = search_outcome_label(search_result)
+            if search_status == "success":
+                if search_outcome == "已切换到其他后端":
+                    search_degraded = "是（已切换）"
+                elif search_result.get("partial"):
+                    search_degraded = "是（部分失败）"
+                else:
+                    search_degraded = "否"
+            elif search_status == "disabled":
+                search_degraded = "未调用（搜索关闭）"
+            elif search_status == "no_results":
+                search_degraded = "否（无有效结果）"
+            elif search_result.get("attempted"):
+                search_degraded = "否（全部失败）"
+            else:
+                search_degraded = "未调用（无可用后端）"
             search_valid_count = len(search_result.get("results", []))
             search_failure_reason = search_result.get("failure_reason", "")
             search_partial = "是" if search_result.get("partial") else "否"
@@ -302,6 +389,7 @@ class OnePercentGenerator(Star):
                 f"Token消耗：{tokens['total_tokens']}（输入{tokens['prompt_tokens']} + 输出{tokens['completion_tokens']}）",
                 f"搜索服务：{search_provider}（{search_duration}）",
                 f"搜索后端：{search_backend_label}",
+                f"搜索状态：{search_outcome}",
                 f"搜索降级：{search_degraded}",
                 f"有效结果：{search_valid_count}",
                 f"搜索部分可用：{search_partial}",

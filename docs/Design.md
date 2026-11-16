@@ -38,8 +38,8 @@ QQ 消息
 | `search_service.py` | 搜索后端调度、超时、结果提取与合并 |
 | `prompt.py` | 经历输入解析、写作风格与提示词组装 |
 | `post_process.py` | 清理模型输出并拼装活动说明与最终正文 |
-| `rate_limiter.py` | 基于 QQ 号的窗口计数和每日计数 |
-| `whitelist.py` | 群聊及私聊白名单判断 |
+| `rate_limiter.py` | 基于发送者 ID 的窗口计数和每日计数 |
+| `whitelist.py` | 旧群/私聊白名单及 UMO 会话精确匹配 |
 | `_conf_schema.json` | AstrBot 插件设置菜单的数据结构 |
 | `metadata.yaml` | 插件名称、版本、作者和仓库信息 |
 
@@ -64,10 +64,11 @@ QQ 消息
 
 ### 权限及限流配置
 
-- `admin_qqs`：管理员 QQ 号列表。
-- `whitelist_groups`：允许使用功能的群号；为空时允许全部群聊。
-- `whitelist_privates`：允许使用功能的 QQ 号；为空时允许全部私聊。
-- `rate_limit.*`：按 QQ 号全局生效的窗口及每日请求上限。
+- `admin_qqs`：管理员发送者 ID 列表，兼容旧配置；QQ 官方平台可能使用 OpenID。
+- `whitelist_mode`：`legacy` 保留旧权限规则，`umo` 使用统一会话白名单。
+- `whitelist_umos`：完整 UMO 列表；空列表不限制，非空时精确匹配。
+- `whitelist_groups`、`whitelist_privates`：仅在 legacy 模式下分别生效，空列表各自允许全部群聊或私聊。
+- `rate_limit.*`：按 AstrBot 返回的发送者 ID 计数的窗口及每日请求上限。
 - `show_generation_stats`：是否在正文后发送模型、耗时、Token 和限流状态。
 
 ## 5. 外部服务边界
@@ -129,7 +130,8 @@ GitHub Actions 在 Python 3.10 和 3.12 上执行语法检查与单元测试。�
 
 ## 9. 已知约束
 
-- 网页搜索依赖公开网页结构，不能保证长期稳定；AstrBot 搜索适配目前仅覆盖 4.29.4 内置 Tavily 工具。
+- 网页搜索依赖公开网页结构，不能保证长期稳定。AstrBot 搜索适配依赖内置 Tavily 工具的能力与配置，已使用 4.29.4 工具类验证，其他版本尚未验证。
+- UMO 精确标识一个实际会话；群聊启用 unique_session 时，某个群内 UMO 不一定代表整个群。
 - 提示词要求模型区分用户提供的经历与公开资料，但不能保证所有模型输出均准确，发布前需要核对。
 - KV 计数采用读取后写回方式，不提供跨进程原子性。
 - 当前窗口算法为固定窗口计数，并非逐请求淘汰的严格滑动窗口。

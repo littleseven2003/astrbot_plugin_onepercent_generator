@@ -2,7 +2,7 @@
 多后端联网搜索服务。
 
 后端：
-- astrbot：AstrBot 4.29.4 内置 web_search_tavily 工具（内部契约，严格版本/配置门禁）
+- astrbot：AstrBot 内置 web_search_tavily 工具（版本仅诊断；验证上下文/工具/调用/配置能力）
 - api：Tavily 结构化搜索 API（basic，1 credit/次，不自动重试）
 - web：Bing + 百度搜索页解析（尽力而为，不抓取结果链接正文）
 - off：关闭
@@ -12,6 +12,8 @@
 
 import asyncio
 import html as html_lib
+import importlib.metadata
+import inspect
 import ipaddress
 import json
 import logging
@@ -52,8 +54,8 @@ SOURCE_LABELS = {
     "astrbot": "AstrBot",
     "web": "网页搜索",
 }
-# 只对已在源码层核实调用契约的 AstrBot 版本启用内部适配。
-SUPPORTED_ASTRBOT_VERSIONS = frozenset({"4.29.4"})
+# 已在源码层实测过的版本，仅用于诊断展示；不再作为硬门禁。
+KNOWN_ASTRBOT_VERSIONS = frozenset({"4.29.4"})
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
@@ -458,14 +460,13 @@ class SearchBackend:
 class AstrBotSearchBackend(SearchBackend):
     """AstrBot 内置 web_search_tavily 适配器。
 
-    契约来自 AstrBot 4.29.4 源码：
-    Context.get_llm_tool_manager() -> FunctionToolManager
-    manager.is_builtin_tool("web_search_tavily")
-    manager.get_builtin_tool("web_search_tavily").call(
-        ContextWrapper[AstrAgentContext], query=..., max_results=...
-    )
+    安全能力发现：
+    - 版本号仅用于诊断，不是硬门禁；
+    - 检查 Context 读配置/取工具管理器、管理器注册/获取内置工具；
+    - 检查工具 call(context, query=..., max_results=...) 的签名契约；
+    - 检查当前会话 provider_settings 与单 Key 限制。
 
-    只有工具已注册、active=True 且当前会话 provider_settings 允许时才可用；
+    只有工具已注册、active=True、调用契约可验证且配置匹配时才可用。
     不直接实例化工具类，避免绕过停用状态。AstrBot 的 Tavily 实现会在多个
     Key 之间对 401/403/429/432 做故障转移重试，因此本项目仅在恰好一个
     Tavily Key 时启用该后端，避免自动重复计费请求。
@@ -476,6 +477,56 @@ class AstrBotSearchBackend(SearchBackend):
     def __init__(self, context=None, adapter=None):
         self._context = context
         self._adapter = adapter
+        self._last_version = self._detect_version()
+
+    @staticmethod
+    def _detect_version() -> str:
+        """读取 AstrBot 版本；无法读取时返回空字符串而不是伪造版本。"""
+        try:
+            import astrbot  # type: ignore
+            version = str(getattr(astrbot, "__version__", "") or "")
+            if version:
+                return version
+        except Exception:
+            pass
+        try:
+            return str(importlib.metadata.version("astrbot"))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _call_contract_ok(tool) -> bool:
+        """只接受带 context 位置参数且支持 query/max_results 的 call。"""
+        call = getattr(tool, "call", None)
+        if not callable(call) or not inspect.iscoroutinefunction(call):
+            return False
+        try:
+            signature = inspect.signature(call)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        positional = [
+            parameter for parameter in parameters.values()
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        var_positional = any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters.values()
+        )
+        has_context = (
+            bool(positional)
+            and positional[0].name in {"context", "ctx"}
+        ) or var_positional
+        var_keyword = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        has_query = "query" in parameters or var_keyword
+        has_max_results = "max_results" in parameters or var_keyword
+        return has_context and has_query and has_max_results
 
     async def availability(self, event=None) -> tuple[bool, str]:
         if self._adapter is not None:
@@ -485,15 +536,6 @@ class AstrBotSearchBackend(SearchBackend):
         umo = getattr(event, "unified_msg_origin", None)
         if not umo:
             return False, "astrbot_context_missing"
-
-        try:
-            import astrbot  # type: ignore
-        except Exception:
-            return False, "astrbot_contract_unavailable"
-
-        version = str(getattr(astrbot, "__version__", ""))
-        if version not in SUPPORTED_ASTRBOT_VERSIONS:
-            return False, "astrbot_version_unverified"
 
         try:
             from astrbot.core.agent.run_context import ContextWrapper  # noqa: F401
@@ -517,6 +559,8 @@ class AstrBotSearchBackend(SearchBackend):
             return False, "astrbot_tool_unregistered"
         if tool is None:
             return False, "astrbot_tool_unregistered"
+        if not self._call_contract_ok(tool):
+            return False, "astrbot_call_contract_unverified"
         if not bool(getattr(tool, "active", True)):
             return False, "astrbot_tool_disabled"
 
@@ -566,23 +610,26 @@ class AstrBotSearchBackend(SearchBackend):
                 int((time.monotonic() - start) * 1000),
             )
 
-        if not isinstance(payload, str):
+        if not isinstance(payload, (str, dict)):
             return BackendResult(
                 self.name, "failed", [], "invalid_response",
                 int((time.monotonic() - start) * 1000),
             )
-        if payload.startswith("Error:"):
-            return BackendResult(
-                self.name, "failed", [], "astrbot_search_error",
-                int((time.monotonic() - start) * 1000),
-            )
-        try:
-            data = json.loads(payload)
-        except Exception:
-            return BackendResult(
-                self.name, "failed", [], "invalid_response",
-                int((time.monotonic() - start) * 1000),
-            )
+        if isinstance(payload, str):
+            if payload.startswith("Error:"):
+                return BackendResult(
+                    self.name, "failed", [], "astrbot_search_error",
+                    int((time.monotonic() - start) * 1000),
+                )
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return BackendResult(
+                    self.name, "failed", [], "invalid_response",
+                    int((time.monotonic() - start) * 1000),
+                )
+        else:
+            data = payload
         if not isinstance(data, dict):
             return BackendResult(
                 self.name, "failed", [], "invalid_response",
@@ -1891,6 +1938,7 @@ _REASON_TEXT = {
     "astrbot_context_missing": "缺少 AstrBot 会话上下文",
     "astrbot_version_unverified": "AstrBot 版本未验证",
     "astrbot_contract_unavailable": "AstrBot 搜索契约不可用",
+    "astrbot_call_contract_unverified": "AstrBot 工具调用契约未验证",
     "astrbot_config_unavailable": "AstrBot 配置不可读",
     "astrbot_search_disabled": "AstrBot 搜索未启用",
     "astrbot_provider_unverified": "AstrBot 搜索提供商未验证",
@@ -1919,6 +1967,36 @@ _REASON_TEXT = {
     "backend_unavailable": "后端不可用",
     "no_backend": "没有可用后端",
 }
+
+
+def search_outcome_label(result: dict) -> str:
+    """统计用搜索结果状态，避免把“全部失败”误写成“已降级”。"""
+    status = result.get("status", "failed")
+    if status == "success":
+        attempts = result.get("attempted") or []
+        skipped = result.get("skipped") or []
+        effective = result.get("effective_backend") or ""
+        first_backend = (
+            attempts[0].get("backend") if attempts else ""
+        )
+        switched = bool(skipped) or (
+            bool(first_backend and effective)
+            and first_backend != effective
+        )
+        if switched:
+            return "已切换到其他后端"
+        if result.get("partial"):
+            return "首选后端部分成功"
+        return "首选后端成功"
+    if status == "disabled":
+        return "未调用（搜索关闭）"
+    if status == "no_results":
+        return "已调用但无有效结果"
+    if result.get("attempted"):
+        return "全部候选后端失败"
+    if result.get("skipped"):
+        return "未调用（无可用后端）"
+    return "未调用"
 
 
 def format_source_failures(failures: list[dict]) -> str:
