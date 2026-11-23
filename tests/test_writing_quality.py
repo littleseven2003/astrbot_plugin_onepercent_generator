@@ -115,9 +115,9 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
         self.assertIn('游戏名称"星露谷物语"', prompt)
         self.assertIn('只能使用"星露谷物语"这个名称', prompt)
         self.assertIn("像素风农场模拟游戏", prompt)
-        self.assertIn("【搜索资料（不可信参考", prompt)
+        self.assertIn("【搜索素材（不可信参考", prompt)
 
-    def test_experience_prompt_allows_only_user_facts(self):
+    def test_experience_prompt_keeps_user_facts_and_allows_grounded_scenes(self):
         experience = "我玩了 20 小时，最喜欢钓鱼和布置农场。"
         prompt = build_main_prompt(
             "星露谷物语",
@@ -126,13 +126,20 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
             variant="warm",
         )
 
-        self.assertIn("【用户真实经历（唯一可用的个人事实来源）】", prompt)
+        self.assertIn("【用户真实经历（唯一可用的个人事实来源，优先保留）】", prompt)
         self.assertIn(experience, prompt)
-        self.assertIn("只能使用上述经历中明确出现", prompt)
-        self.assertIn("不得新增具体游玩时长", prompt)
-        self.assertIn("搜索资料可以用于发售平台等客观游戏信息", prompt)
+        self.assertIn("用户经历里明确出现的时间、事件、人物、感受和细节优先保留", prompt)
+        self.assertIn("可以围绕用户经历补写与该游戏背景一致的第一人称场景", prompt)
+        self.assertIn("用户没给游玩时间时，可以结合发售时间与正文故事写一个合理时期", prompt)
+        self.assertIn("搜索素材只作客观游戏信息的参考", prompt)
         self.assertIn("不得覆盖或扩写用户经历", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
+        self.assertIn("正文约 800-1200 个中文字", prompt)
+        self.assertNotIn("写“未提供”", prompt)
+        self.assertNotIn("写“待补充”", prompt)
+        self.assertNotIn("不要输出段落标签", prompt)
+        self.assertIn("并写下面三个前置字段行", prompt)
+        self.assertIn("不能出现类型矛盾", prompt)
 
     def test_experience_prompt_allows_objective_platform_from_search(self):
         prompt = build_main_prompt(
@@ -142,36 +149,85 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
             variant="warm",
         )
 
-        self.assertIn("发售平台：可基于搜索资料", prompt)
-        self.assertIn("不得把搜索资料写成个人经历", prompt)
+        self.assertIn("搜索素材只作客观游戏信息的参考", prompt)
+        self.assertIn("不得把素材里第三方玩家的故事写成用户自己的经历", prompt)
         self.assertNotIn("发售平台：只写经历", prompt)
+        self.assertNotIn("只在有依据时写", prompt)
+        self.assertIn("结合搜索素材与游戏常识写真实、合理的发售平台", prompt)
         self.assertIn("发售平台为 PC、iOS、Android、PS5", prompt)
 
-    def test_no_experience_prompt_forbids_first_person_fabrication(self):
+    def test_no_experience_prompt_allows_grounded_first_person(self):
         prompt = build_main_prompt(
             "原神", "搜索资料", experience="", variant="concise"
         )
 
-        self.assertIn("【用户真实经历】\n未提供", prompt)
-        self.assertIn("不要写第一人称", prompt)
-        self.assertIn("不要虚构具体游玩时长", prompt)
-        self.assertIn("不得写成用户经历", prompt)
-        self.assertIn("改写客观推荐理由", prompt)
+        self.assertIn("【用户真实经历】\n未提供。可以写第一人称的合理游玩场景", prompt)
+        self.assertIn("按发售时间给出合理的游玩时期", prompt)
+        self.assertIn("第一人称场景必须严格符合这些设定", prompt)
+        self.assertIn("素材不足或互相矛盾时，不写具体的第一人称事件", prompt)
+        self.assertIn("自然的推荐草稿", prompt)
+        self.assertIn("正文约 800-1200 个中文字", prompt)
+        self.assertNotIn("写“资料未提供”", prompt)
+        self.assertNotIn("写“待补充”", prompt)
         self.assertNotIn("请务必写一段有真实感的个人体验", prompt)
         self.assertNotIn("根据你对该游戏的了解自然生成", prompt)
+
+    def test_story_must_fit_game_genre_in_both_modes(self):
+        with_experience = build_main_prompt(
+            "生化危机", "恐怖生存：资源有限，弹药稀少。", experience="我在洋馆里玩过。"
+        )
+        without_experience = build_main_prompt(
+            "生化危机", "恐怖生存：资源有限，弹药稀少。"
+        )
+        for prompt in (with_experience, without_experience):
+            self.assertIn("不能出现类型矛盾", prompt)
+            self.assertIn("恐怖写", prompt)
+            self.assertNotIn("不要编造第一人称经历", prompt)
+
+    def test_genre_constraints_cover_horror_shooter_and_missing_material(self):
+        # 复审三组样本：恐怖、硬核射击、缺可信素材；Prompt 不能再保留
+        # 「禁止一切演绎」的冲突指令，同时必须约束题材逻辑。
+        horror = build_main_prompt(
+            "生化危机", "恐怖生存：洋馆、资源有限、弹药稀少。", experience=""
+        )
+        shooter = build_main_prompt(
+            "逃离塔科夫", "硬核射击：战术、负重、死亡惩罚很重。", experience=""
+        )
+        missing = build_main_prompt("未收录游戏", "", experience="")
+        for prompt in (horror, shooter):
+            self.assertIn("不能出现类型矛盾", prompt)
+            self.assertNotIn("不要写第一人称", prompt)
+            self.assertNotIn("不虚构个人游玩经历", prompt)
+        self.assertIn("恐怖写", horror)
+        self.assertIn("硬核射击写战术与失误代价", shooter)
+        self.assertIn("素材不足或互相矛盾时，不写具体的第一人称事件", missing)
+        self.assertIn("未获取到可用资料", missing)
+        self.assertIn("按游戏常识写合理、自然的平台、时期与推荐人群", missing)
+
+    def test_prompt_field_permission_matches_structure(self):
+        # 输出格式与结构段都要求三个前置字段行，不再出现「只写正文」冲突。
+        for prompt in (
+            build_main_prompt("原神", "素材", experience="我玩了半小时"),
+            build_main_prompt("原神", "素材"),
+        ):
+            self.assertIn("并写下面三个前置字段行", prompt)
+            self.assertIn("「游戏当时发售平台」「玩游戏的时间」「推荐人群（理由）」三行", prompt)
+            self.assertNotIn("只在有依据时写", prompt)
+            self.assertNotIn("五个前置字段由程序固定输出，你只写正文", prompt)
 
     def test_search_material_is_labeled_untrusted_reference(self):
         prompt = build_main_prompt("原神", "搜索摘要 2026-01-01 上线")
 
-        self.assertIn("【搜索资料（不可信参考，可能过时或错误）】", prompt)
+        self.assertIn("【搜索素材（不可信参考，可能过时或错误；不是用户经历）】", prompt)
         self.assertIn("搜索摘要 2026-01-01 上线", prompt)
-        self.assertIn("不得写成用户经历", prompt)
+        self.assertIn("不得把素材里第三方玩家的故事写成用户自己的经历", prompt)
+        self.assertIn("可以依据其中的类型、背景、美术和核心玩法演绎合理情节", prompt)
 
     def test_missing_search_material_degrades_without_fabrication(self):
         prompt = build_main_prompt("原神", "", experience="")
 
         self.assertIn("未获取到可用资料", prompt)
-        self.assertIn("不要猜测具体平台、日期", prompt)
+        self.assertIn("按游戏常识写合理、自然的平台、时期与推荐人群", prompt)
 
     def test_variants_are_observable_but_keep_game_name(self):
         prompts = {
@@ -241,7 +297,10 @@ class WritingPromptTruthBoundaryTests(unittest.TestCase):
 
         self.assertNotIn("标题：错误", cleaned)
         self.assertIn("游戏名称：原神", final)
-        self.assertTrue(final.startswith("什么是【我的百分之一】"))
+        self.assertTrue(
+            final.startswith("【我的百分之一】+【原神】")
+        )
+        self.assertIn("什么是【我的百分之一】", final)
 
 
 if __name__ == "__main__":

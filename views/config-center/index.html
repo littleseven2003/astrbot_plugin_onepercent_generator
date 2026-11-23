@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>小作文生成器</title>
+<link rel="stylesheet" href="./tokens.css"/>
+<link rel="stylesheet" href="./style.css"/>
+</head>
+<body>
+<p id="toast" class="toast hidden" role="status" aria-live="polite"></p>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">百</div><div><strong>小作文控制台</strong><small>百分之一</small></div></div>
+    <nav class="nav" aria-label="配置中心">
+      <button data-page="status" aria-current="page"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span>当前状态</span></button>
+      <button data-page="model"><svg class="ico" viewBox="0 0 24 24"><path d="M7 7h10v10H7z"/><path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4"/></svg><span>模型配置</span></button>
+      <button data-page="search"><svg class="ico" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>搜索配置</span></button>
+      <button data-page="rate"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>频率配置</span></button>
+      <button data-page="session"><svg class="ico" viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 3z"/><path d="M8 9h8M8 12h5"/></svg><span>会话配置</span></button>
+    </nav>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="topbar-title"><h1 id="pageTitle">当前状态</h1><span class="title-divider">/</span><span id="pageKicker">小作文生成器</span></div><span id="dirtyBadge" class="badge hidden">未保存</span></header>
+    <main class="content">
+      <p id="globalNotice" class="notice global-notice hidden" role="status"></p>
+      <section id="page-status" class="section active">
+        <div class="card">
+          <div class="card-head"><h2>用量概览</h2><div class="tools"><div class="seg" id="periodSeg"><button data-period="5h">最近 5 小时</button><button data-period="1d">1 天</button><button data-period="7d" class="active">7 天</button><button data-period="30d">30 天</button><button data-period="all">全部</button></div><div class="chat-filter"><button id="chatToggle" class="select-like chat-toggle" aria-haspopup="true" aria-expanded="false"><span id="chatToggleLabel">全部聊天</span><svg class="caret" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id="chatPanel" class="chat-panel hidden"><div class="chat-panel-head"><strong>按聊天筛选</strong><span id="chatSelectionHint" class="chat-panel-meta">全部聊天</span></div><label class="chat-search"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="chatSearch" type="search" placeholder="搜索聊天名称或 UMO" aria-label="搜索聊天"/></label><div id="chatList" class="chat-list"></div><div class="chat-panel-foot"><div id="chatBulkScope" class="chat-bulk-scope"></div><div class="chat-bulk"><button id="chatAll" class="link-btn">全选</button><span class="bulk-divider"></span><button id="chatNone" class="link-btn">全不选</button></div><button id="chatApply" class="primary small">应用筛选</button></div></div></div></div></div>
+          <div class="card-body">
+            <div class="chart-toolbar"><p id="rangeInfo" class="hint range-info"></p><div class="seg metric-seg" id="metricSeg"><button data-metric="requests" class="active">请求数</button><button data-metric="searches">实际搜索</button><button data-metric="tokens">Tokens</button></div></div>
+            <div id="statCards" class="stat-grid"></div>
+            <div class="chart-wrap"><canvas id="trendChart" role="img" aria-label="按时间范围与聊天筛选的使用趋势图，悬停查看对应数据"></canvas><div id="chartTip" class="chart-tip hidden" role="status" aria-live="polite"></div><div id="chartEmpty" class="empty hidden">当前范围内没有实际记录</div></div>
+            <details class="chart-data"><summary>查看分段数据</summary><div id="chartTable"></div></details>
+            <p id="tokenNote" class="hint"></p>
+          </div>
+        </div>
+        <div class="card"><div class="card-head"><h2>配置摘要</h2><button id="refreshAll" class="ghost">刷新</button></div><div class="config-list">
+          <div class="config-item"><div class="config-label">当前模型</div><div><strong id="sumModel">加载中…</strong><small id="sumModelMeta"></small><small id="sumModelTest" class="hint"></small></div><div class="config-actions"><button id="testCurrentModel" class="secondary small">测试当前模型</button><button class="config-link" data-status-go="model">配置</button></div></div>
+          <div class="config-item"><div class="config-label">搜索策略</div><div><strong id="sumSearch">加载中…</strong><small id="sumSearchMeta"></small></div><div class="config-actions"><button class="config-link" data-status-go="search">查看配置</button></div></div>
+          <div class="config-item"><div class="config-label">频率策略</div><div><strong id="sumRate">加载中…</strong><small id="sumRateMeta"></small></div><div class="config-actions"><button class="config-link" data-status-go="rate">查看配置</button></div></div>
+          <div class="config-item"><div class="config-label">会话范围</div><div><strong id="sumSession">加载中…</strong><small id="sumSessionMeta"></small></div><div class="config-actions"><button class="config-link" data-status-go="session">管理会话</button></div></div>
+        </div></div>
+        <div class="card"><div class="card-head"><h2>保留与统计口径</h2></div><div class="card-body"><p id="retentionInfo" class="hint"></p><ul class="plain-list"><li>请求数：实际进入生成流程的请求，失败也计数。</li><li>实际搜索：生成与主动测试中真正发起过的搜索后端尝试；跳过和关闭不计。</li><li>降级/回退：同一请求中第二个及之后真正发起的后端尝试；一次请求可能产生多条。</li><li>模型失败：按失败的模型调用计数；主动测试单独记录，不计入请求数。</li><li>Tokens：仅累加上游实际返回的用量；缺失会标记为不完整，不按 0 处理。</li></ul></div></div>
+      </section>
+
+      <section id="page-model" class="section">
+        <div class="card">
+          <div class="card-head"><h2>模型来源</h2><div class="seg seg-large" role="group" aria-label="模型来源"><button id="sourceAstrbot" type="button" class="active" aria-pressed="true">AstrBot 预设模型</button><button id="sourceManual" type="button" aria-pressed="false">自定义模型</button></div></div>
+          <div id="astrbotPanel">
+            <div class="card-body">
+              <div class="row-between"><div><h3>选择模型</h3><p id="providerHint" class="hint"></p></div><button id="refreshProviders" class="ghost">刷新</button></div>
+              <label class="field"><span>搜索已配置模型</span><input id="providerFilter" type="search" placeholder="模型较多时输入名称或 Provider ID 过滤" autocomplete="off"/></label>
+              <label class="field"><span>模型 Provider</span><select id="providerSelect" aria-label="选择 AstrBot 已配置的模型"></select><small id="providerSelectionState" class="hint provider-selection" aria-live="polite">未选择模型</small></label>
+            </div>
+          </div>
+          <div id="manualPanel" class="hidden">
+            <div class="card-body">
+              <h3 class="subhead">连接信息</h3>
+              <div class="grid two"><label class="field"><span>供应商预设</span><select id="presetSelect"></select></label><label class="field"><span>接口格式</span><select id="apiFormat"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label></div>
+              <label class="field"><span>Base URL</span><input id="baseUrl" type="url" placeholder="https://api.example.com/v1" autocomplete="off"/></label>
+              <label class="field"><span>API Key</span><input id="apiKey" type="password" placeholder="留空且地址未变时保留已保存 Key，填入新值将覆盖" autocomplete="new-password"/><small id="keyState" class="hint key-state"></small></label>
+              <h3 class="subhead divided">模型</h3>
+              <div class="row-between"><div><p id="modelHint" class="hint"></p></div><button id="fetchModels" class="secondary btn-compact">获取模型列表</button></div>
+              <label class="field"><span>模型名称</span><input id="modelInput" list="modelList" placeholder="获取列表后选择，或手动填写" autocomplete="off"/><datalist id="modelList"></datalist></label>
+              <p id="contextHint" class="hint">上下文长度：未知（未从服务可靠取得，不猜测）</p>
+              <label class="check"><input id="sendTemperature" type="checkbox"/>发送 temperature 参数</label>
+            </div>
+          </div>
+          <div class="card-foot action-row"><button id="testModel" class="secondary">测试当前模型</button><span class="autosave-note">修改后自动保存</span><span id="modelMessage" class="message" role="status"></span></div>
+        </div>
+      </section>
+
+      <section id="page-search" class="section">
+        <p id="searchDraftHint" class="hint search-autosave-hint">修改后自动保存，无需点击保存按钮。</p>
+
+        <div class="card" id="searchPolicyCard">
+          <div class="card-head"><h2>搜索策略</h2><span class="pill">从上到下依次尝试</span></div>
+          <div class="card-body">
+            <label class="check"><input id="searchEnabled" type="checkbox"/>启用搜索</label>
+            <div class="mode-field">
+              <div class="mode-head">
+                <div>
+                  <span class="mode-title">搜索顺序与分组</span>
+                  <p class="hint">从上到下依次尝试已勾选的组；某一组返回有效结果即停止，不再继续后面的组。AstrBot 组内先官方搜索、再已安装的搜索插件；全部取消勾选或关闭总开关时不发起任何搜索。</p>
+                </div>
+              </div>
+              <div id="modeList" class="candidate-list mode-list" role="list" aria-label="搜索分组优先级"></div>
+            </div>
+            <div class="grid three">
+              <label class="field"><span>结果数</span><input id="searchResults" type="number" min="1" max="10"/></label>
+              <label class="field"><span>总超时 (ms)</span><input id="searchTimeout" type="number" min="1000" max="60000"/></label>
+              <label class="field"><span>单后端超时 (ms，0=自动)</span><input id="searchPerTimeout" type="number" min="0" max="60000"/></label>
+            </div>
+            <p class="hint">网页组会分别查询「首发平台／玩法机制」与「体验评价／剧情」，共享同一份总超时与结果数上限；不同查询的结果都会进入素材池，相同链接自动去重。</p>
+          </div>
+        </div>
+
+        <div class="card" id="searchDiagCard">
+          <div class="card-head"><h2>诊断</h2><button id="searchTest" class="secondary btn-compact">主动测试搜索</button></div>
+          <div class="card-body">
+            <p id="searchMessage" class="hint" aria-live="polite"></p>
+            <p id="searchTestResult" class="hint"></p>
+            <p id="searchFailure" class="hint">最近一次没有失败记录。</p>
+            <pre id="lastSearch" class="pre"></pre>
+          </div>
+        </div>
+
+        <div class="card" id="searchAdvancedCard">
+          <div class="card-head"><h2>高级参数</h2><span class="pill">默认素材直传</span></div>
+          <div class="card-body">
+            <div class="grid three">
+              <label class="field"><span>素材总字数预算</span><input id="materialMaxChars" type="number" min="1000" max="6000"/></label>
+              <label class="field"><span>素材条数上限</span><input id="materialMaxItems" type="number" min="1" max="10"/></label>
+              <label class="field"><span>单条片段字数</span><input id="materialSnippetChars" type="number" min="120" max="600"/></label>
+            </div>
+            <p class="hint">默认把清洗后的「标题、来源、链接、片段」直接交给生成模型，每次生成只调用一次写作模型；片段按句子边界截断。</p>
+            <label class="check"><input id="summarizeEnabled" type="checkbox"/>【高级】先用模型汇总素材（关闭时直接传素材，推荐关闭）</label>
+            <div class="grid two">
+              <label class="field"><span>汇总输入预算</span><input id="summaryInput" type="number" min="200" max="50000"/></label>
+              <label class="field"><span>汇总输出字数</span><input id="summaryChars" type="number" min="20" max="1000"/></label>
+            </div>
+            <p class="hint">开启汇总会多一次模型调用，并可能把素材压得过短；只有确实需要短摘要时再打开。</p>
+            <div class="grid two">
+              <label class="field"><span>搜索 API</span><select id="apiProvider"><option value="tavily">Tavily</option></select></label>
+              <label class="field"><span>API Base URL</span><input id="searchBase" type="url"/></label>
+            </div>
+            <label class="field"><span>搜索 API Key</span><input id="searchKey" type="password" placeholder="留空保留同地址已保存的 Key；输入新值后失焦或回车覆盖" autocomplete="new-password"/></label>
+          </div>
+        </div>
+
+        <p id="searchSaveMessage" class="message autosave-status" role="status"></p>
+      </section>
+
+      <section id="page-rate" class="section">
+        <div class="card"><div class="card-head"><h2>请求频率</h2><span class="pill">0 = 不限制</span></div><div class="card-body">
+          <div class="range-row"><div><strong>时间窗口</strong><p class="hint">0 分钟表示不做窗口限制</p></div><input id="windowRange" type="range" min="0" max="1440" step="1"/><input id="windowNumber" type="number" min="0" max="1440"/><span>分钟</span></div>
+          <div id="maxRow" class="range-row"><div><strong>窗口内最多次数</strong><p class="hint">仅窗口不为 0 时生效</p></div><input id="maxRange" type="range" min="1" max="1000"/><input id="maxNumber" type="number" min="1" max="1000"/><span>次</span></div>
+          <div class="range-row"><div><strong>每日最多次数</strong><p class="hint">0 表示每日不限制</p></div><input id="dailyRange" type="range" min="0" max="1000"/><input id="dailyNumber" type="number" min="0" max="1000"/><span>次</span></div>
+          <div class="stack-fields"><div class="setting-row"><label class="setting-label" for="rateTimezone">每日重置时区</label><select id="rateTimezone" aria-label="每日重置时区"></select><p class="hint setting-hint">每日 00:00 按此时区重置；默认使用服务器本地时区。</p></div><div class="field"><span>运行时规则</span><p id="rateRuntime" class="hint"></p></div></div>
+          <p class="hint">管理员不受频率限制；并发请求在单进程内串行计数，避免同一身份并发穿透。每日按指定时区 00:00 重置。</p>
+          <div class="action-row"><span class="autosave-note">修改后自动保存</span><span id="rateMessage" class="message"></span></div>
+        </div></div>
+        <div class="card identity-card"><div class="card-head"><div><h2>身份关联</h2><p class="card-sub">同一人的多个账号可共用一份频率额度</p></div><span class="pill">仅管理员确认</span></div><div class="card-body"><p class="identity-purpose">用途：把同一连接器下确认属于同一人的多个 UID 关联起来，它们会共用一份频率额度；共同历史只计一次，解除关联后各自新增的请求相加，不会重置额度。普通用户无需设置这里。</p><div class="identity-summary"><div class="identity-stat"><span>已关联</span><strong id="identityGroupCount">0</strong><small>组</small></div><div class="identity-stat"><span>已知身份</span><strong id="identityKnownCount">0</strong><small>个</small></div><span class="hint identity-summary-note">明细较多时可在下方滚动查看</span></div><details class="identity-details"><summary>查看身份明细</summary><div class="identity-scroll"><div class="subhead">已关联</div><div id="linkList" class="list compact"></div><div class="subhead divided">可关联身份</div><div id="identityList" class="list compact"></div></div><div class="identity-add"><label class="field"><span>连接器</span><input id="identityConnector" placeholder="例如 qq_official"/></label><label class="field grow"><span>UID（逗号分隔）</span><input id="identityUids" placeholder="uid1, uid2"/></label><button id="linkIdentity" class="secondary btn-compact">关联身份</button></div></details></div></div>
+      </section>
+
+      <section id="page-session" class="section">
+        <div class="card"><div class="card-head"><h2>会话总开关</h2><span class="pill">优先级：类型开关 → 迁移 → 列表</span></div><div class="card-body"><label class="check"><input id="allowPrivate" type="checkbox"/>允许私聊</label><label class="check"><input id="allowGroup" type="checkbox"/>允许群聊</label><p id="migrationBanner" class="notice hidden"></p><p id="umoPending" class="notice hidden"></p><p class="hint">非空会话列表只允许列表中启用且 UMO 完全一致的会话；旧版 QQ/群号限制无法自动映射时会保持暂停，必须添加明确的 UMO 会话后才会解除。没有旧版限制时，空列表表示不限制。</p></div></div>
+        <div class="card"><div class="card-head"><div><h2>管理员</h2><p class="card-sub">管理员不受频率限制；添加或移除后立即生效</p></div><span class="pill">按连接器 + UID</span></div><div class="card-body"><div class="inline-add"><label class="field"><span>连接器</span><input id="adminConnector" placeholder="例如 qq_official"/></label><label class="field grow"><span>发送者 UID（/sid）</span><input id="adminUid" placeholder="不要填 UMO 或群号"/></label><button id="addAdmin" class="secondary btn-compact">添加</button></div><div id="adminList" class="list compact"></div><p id="adminPending" class="notice hidden"></p><p id="adminMessage" class="hint"></p><p class="hint">管理员身份与会话白名单彼此独立；不需要额外保存，添加或移除后自动写入配置。</p></div></div>
+        <div class="card"><div class="card-head"><div><h2>会话列表</h2><p class="card-sub">只放行列表中勾选启用的精确 UMO；修改后立即生效</p></div><span class="pill">精确 UMO</span></div><div class="card-body"><div class="inline-add"><label class="field grow"><span>新增 UMO（/sid）</span><input id="newUmo" placeholder="platform:MessageType:session"/></label><button id="addSession" class="secondary btn-compact">添加</button></div><div class="filter-row session-filters"><label class="field compact"><span>连接器筛选</span><select id="sessionConnectorFilter"><option value="">全部连接器</option></select></label><label class="field compact"><span>类型筛选</span><select id="sessionTypeFilter"><option value="">全部类型</option><option value="private">私聊</option><option value="group">群聊</option><option value="unknown">未知</option></select></label></div><div id="sessionList" class="list compact session-list"></div><p id="sessionMessage" class="hint"></p><div id="sessionRepair"></div><p class="hint">QQ 官方 unique_session 开启时，群 UMO 可能包含成员身份；授权一个成员 UMO 不等于授权整个群。无法自动发现的会话请通过 /sid 添加，插件不会虚构会话名称。</p></div></div>
+        <div class="card"><div class="card-head"><h2>高级</h2></div><div class="card-body"><label class="field"><span>预设游戏（每行一个）</span><textarea id="presetGames" rows="5"></textarea></label><label class="check"><input id="showStats" type="checkbox"/>生成后发送统计信息</label><div class="action-row"><span class="autosave-note">修改后自动保存</span><span id="advancedMessage" class="message"></span></div></div></div>
+      </section>
+    </main>
+    <div id="loading" class="loading hidden">加载中…</div>
+  </div>
+</div>
+<div id="confirmLayer" class="confirm-layer hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmText">
+  <div class="confirm-box">
+    <h2 id="confirmTitle">有未保存的修改</h2>
+    <p id="confirmText"></p>
+    <div class="action-row confirm-actions">
+      <button id="confirmCancel" type="button" class="secondary">取消，保留草稿</button>
+      <button id="confirmOk" type="button" class="primary">放弃草稿并继续</button>
+    </div>
+  </div>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

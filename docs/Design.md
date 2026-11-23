@@ -1,5 +1,7 @@
 # 百分之一小作文生成器：设计文档
 
+> 本文记录旧版本设计，部分模型、搜索、会话与权限描述已过时。当前配置和迁移说明请参阅 [README](../README.md)。
+
 ## 1. 项目定位
 
 本项目是一个 AstrBot 插件。用户在 QQ 群聊或私聊中发送关键词后，插件根据指定或随机选择的游戏生成符合 TapTap《百分之一》活动格式的推荐帖。
@@ -38,8 +40,8 @@ QQ 消息
 | `search_service.py` | 搜索后端调度、超时、结果提取与合并 |
 | `prompt.py` | 经历输入解析、写作风格与提示词组装 |
 | `post_process.py` | 清理模型输出并拼装活动说明与最终正文 |
-| `rate_limiter.py` | 基于 QQ 号的窗口计数和每日计数 |
-| `whitelist.py` | 群聊及私聊白名单判断 |
+| `rate_limiter.py` | 基于发送者 ID 的窗口计数和每日计数 |
+| `whitelist.py` | 旧群/私聊白名单及 UMO 会话精确匹配 |
 | `_conf_schema.json` | AstrBot 插件设置菜单的数据结构 |
 | `metadata.yaml` | 插件名称、版本、作者和仓库信息 |
 
@@ -55,19 +57,21 @@ QQ 消息
 ### 搜索配置
 
 - `search_config.enabled`：旧搜索开关，关闭时强制关闭所有搜索。
-- `search_config.mode`：`auto`、`astrbot`、`api`、`web` 或 `off`；手动模式可通过 `fallback_enabled` 允许向后降级。
+- `search_config.mode_order` / `mode_enabled`：三个搜索组（`astrbot`、`api`、`web`）的全序与勾选子集，运行时按此从上到下尝试；`mode`/`fallback_enabled` 仅保留用于旧配置迁移与兼容展示。
 - `search_config.api_provider`、`api_key`、`api_base_url`：独立搜索 API 的配置，目前支持 Tavily。
 - `search_config.timeout_ms`：所有后端共享的搜索总时间预算；`per_backend_timeout_ms` 控制单后端上限。
 - `search_config.result_count`：每个搜索源采用的结果数，运行时限制为 1–10。
-- `search_config.summarize_enabled`：是否调用 AI 整理搜索结果。
+- `search_config.summarize_enabled`：【高级】是否调用 AI 汇总搜索素材；默认关闭，清洗后的标题/来源/链接/片段直接传给生成模型（每次生成只调用一次写作模型）。
+- `search_config.material_max_chars` / `material_max_items` / `material_snippet_chars`：素材直传的总字数（默认 3000）、条数（默认 6）与单条片段（默认 400，按句子截断）。
 - `search_config.summarize_max_chars`：进入生成 Prompt 的摘要最大字数；`summary_input_max_chars` 限制 AI 汇总输入。
 
 ### 权限及限流配置
 
-- `admin_qqs`：管理员 QQ 号列表。
-- `whitelist_groups`：允许使用功能的群号；为空时允许全部群聊。
-- `whitelist_privates`：允许使用功能的 QQ 号；为空时允许全部私聊。
-- `rate_limit.*`：按 QQ 号全局生效的窗口及每日请求上限。
+- `admin_qqs`：管理员发送者 ID 列表，兼容旧配置；QQ 官方平台可能使用 OpenID。
+- `whitelist_mode`：`legacy` 保留旧权限规则，`umo` 使用统一会话白名单。
+- `whitelist_umos`：完整 UMO 列表；空列表不限制，非空时精确匹配。
+- `whitelist_groups`、`whitelist_privates`：仅在 legacy 模式下分别生效，空列表各自允许全部群聊或私聊。
+- `rate_limit.*`：按 AstrBot 返回的发送者 ID 计数的窗口及每日请求上限。
 - `show_generation_stats`：是否在正文后发送模型、耗时、Token 和限流状态。
 
 ## 5. 外部服务边界
@@ -98,7 +102,7 @@ Responses 的 `input_tokens` 和 `output_tokens` 会分别归一化为 `prompt_t
 
 ### 搜索服务
 
-自动模式按已验证的 AstrBot 搜索工具、已配置的 Tavily API、网页搜索的顺序尝试；手动模式默认不降级。网页搜索并发请求 Bing 和百度，单源失败不阻止另一来源返回结果。全部来源失败时返回空摘要，正文生成仍可继续。
+搜索策略为三组有序列表（Astrbot与搜索插件、搜索API、网页搜索）：按保存顺序尝试已勾选组，首个有效结果即停止，AstrBot 组内先官方工具再搜索插件；总开关关闭或三组全关时不发起调用。网页组按「首发平台／玩法机制」与「体验评价／剧情」两路查询，并发请求 Bing 和百度，共享同一份总超时与结果数上限；按规范化链接去重，单源失败不阻止另一来源返回结果。AnySearch 分节 Markdown（标题 + `- **URL**:` + 摘要）与 JSON、`[标题](链接)` 形式都可解析。全部来源失败时返回空摘要，正文生成仍可继续。
 
 搜索页 HTML 结构可能变化，因此解析失败必须被视为可恢复故障。
 
@@ -129,7 +133,8 @@ GitHub Actions 在 Python 3.10 和 3.12 上执行语法检查与单元测试。�
 
 ## 9. 已知约束
 
-- 网页搜索依赖公开网页结构，不能保证长期稳定；AstrBot 搜索适配目前仅覆盖 4.29.4 内置 Tavily 工具。
+- 网页搜索依赖公开网页结构，不能保证长期稳定。AstrBot 搜索适配依赖内置 Tavily 工具的能力与配置，已使用 4.29.4 工具类验证，其他版本尚未验证。
+- UMO 精确标识一个实际会话；群聊启用 unique_session 时，某个群内 UMO 不一定代表整个群。
 - 提示词要求模型区分用户提供的经历与公开资料，但不能保证所有模型输出均准确，发布前需要核对。
 - KV 计数采用读取后写回方式，不提供跨进程原子性。
 - 当前窗口算法为固定窗口计数，并非逐请求淘汰的严格滑动窗口。

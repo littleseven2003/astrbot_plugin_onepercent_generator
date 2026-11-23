@@ -24,10 +24,14 @@ from astrbot_plugin_onepercent_generator.search_service import (  # noqa: E402
     SearchService,
     TavilySearchBackend,
     WebSearchBackend,
+    build_material_block,
     build_search_summary,
+    game_search_queries,
     format_search_diagnostic,
     prepare_search_digest,
     resolve_search_mode,
+    search_groups_from_config,
+    search_outcome_label,
 )
 
 
@@ -138,6 +142,7 @@ class AutoOrderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["effective_backend"], "astrbot")
+        self.assertEqual(result["mode"], "auto")
         self.assertFalse(result["degraded"])
         self.assertEqual(len(astrbot.calls), 1)
         self.assertEqual(len(api.calls), 0)
@@ -190,7 +195,7 @@ class AutoOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["effective_backend"], "web")
         self.assertEqual(calls["n"], 0)
-        self.assertEqual(result["skipped"][1]["reason"], "missing_api_key")
+        self.assertEqual(result["skipped"][2]["reason"], "missing_api_key")
         await svc.close()
 
     async def test_auto_all_unavailable_is_failed(self):
@@ -206,7 +211,7 @@ class AutoOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_reason"], "verification_page")
         self.assertEqual(len(result["attempted"]), 1)
-        self.assertEqual(len(result["skipped"]), 2)
+        self.assertEqual(len(result["skipped"]), 3)
         self.assertTrue(result["degraded"])
         await svc.close()
 
@@ -969,6 +974,7 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(result["mode"], "web")
         self.assertEqual(len(result["results"]), 2)
         self.assertEqual({i["source"] for i in result["results"]},
                          {"bing", "baidu"})
@@ -1036,6 +1042,8 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
             "reason": "timeout",
         }])
         diag = await svc.test_search("游戏")
+        self.assertEqual(diag["mode"], "web")
+        self.assertEqual(diag["effective_backend"], "web")
         self.assertIn("部分可用：是", diag["message"])
         self.assertIn("百度", diag["message"])
         self.assertIn("超时", diag["message"])
@@ -1242,14 +1250,15 @@ class WebBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["partial"])
         self.assertTrue(result["cleanup_incomplete"])
         self.assertFalse(cleanup_done)
-        self.assertEqual(cancel_count, [1])
+        # 网页组现在按两路查询各发一次请求，百度来源被取消两次。
+        self.assertEqual(cancel_count, [1, 1])
         self.assertLess(elapsed, 0.6)
         self.assertGreaterEqual(web.pending_cleanup_count, 1)
 
         await svc.close()
 
-        self.assertTrue(cleanup_done)
-        self.assertEqual(cancel_count, [1])
+        self.assertEqual(cleanup_done, [1, 1])
+        self.assertEqual(cancel_count, [1, 1])
         self.assertEqual(web.pending_cleanup_count, 0)
         self.assertFalse(web.close_incomplete)
 
@@ -2245,7 +2254,7 @@ class DiagnosticAndBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AstrBot", diag["message"])
         self.assertIn("Tavily API", diag["message"])
         self.assertIn("跳过", diag["message"])
-        self.assertEqual(len(diag["skipped"]), 2)
+        self.assertEqual(len(diag["skipped"]), 3)
         await svc.close()
 
     async def test_admin_diagnostic_failure_includes_reason(self):
@@ -2324,11 +2333,48 @@ class ManagedEvent:
     unified_msg_origin = "webchat:managed-test"
 
 
+class SearchOutcomeLabelTests(unittest.TestCase):
+    def test_outcome_labels_distinguish_switch_and_all_failed(self):
+        self.assertEqual(
+            search_outcome_label({
+                "status": "success",
+                "degraded": True,
+                "effective_backend": "api",
+                "attempted": [{"backend": "api"}],
+                "skipped": [{"backend": "astrbot"}],
+            }),
+            "已切换到其他后端",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "failed",
+                "attempted": [{"backend": "astrbot"}],
+            }),
+            "全部候选后端失败",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "disabled",
+                "attempted": [],
+            }),
+            "未调用（搜索关闭）",
+        )
+        self.assertEqual(
+            search_outcome_label({
+                "status": "failed",
+                "attempted": [],
+                "skipped": [{"backend": "web"}],
+            }),
+            "未调用（无可用后端）",
+        )
+
+
 class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _fake_astrbot_modules():
+    def _fake_astrbot_modules(version="4.29.4"):
         astrbot = types.ModuleType("astrbot")
-        astrbot.__version__ = "4.29.4"
+        if version is not None:
+            astrbot.__version__ = version
         core = types.ModuleType("astrbot.core")
         agent = types.ModuleType("astrbot.core.agent")
         run_context = types.ModuleType("astrbot.core.agent.run_context")
@@ -2406,6 +2452,59 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(available, reason)
         self.assertEqual(reason, "")
 
+    async def test_unknown_version_with_verified_contract_is_available(self):
+        tool = FakeManagedTool(active=True)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules(version="9.9.9"):
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertTrue(available, reason)
+        self.assertEqual(reason, "")
+
+    async def test_missing_version_with_verified_contract_is_available(self):
+        tool = FakeManagedTool(active=True)
+        context = ManagedContext(
+            self._cfg(), FakeToolManager(tool=tool)
+        )
+        with self._fake_astrbot_modules(version=None):
+            backend = AstrBotSearchBackend(context=context)
+            available, reason = await backend.availability(ManagedEvent())
+
+        self.assertTrue(available, reason)
+        self.assertEqual(reason, "")
+
+    async def test_broken_tool_call_contract_is_unavailable(self):
+        class BadCallTool:
+            active = True
+
+            async def call(self, **kwargs):
+                return "{}"
+
+        class QueryFirstTool:
+            active = True
+
+            async def call(self, query, max_results):
+                return "{}"
+
+        for tool in (BadCallTool(), QueryFirstTool()):
+            with self.subTest(tool=type(tool).__name__):
+                context = ManagedContext(
+                    self._cfg(), FakeToolManager(tool=tool)
+                )
+                with self._fake_astrbot_modules(version="9.9.9"):
+                    backend = AstrBotSearchBackend(context=context)
+                    available, reason = await backend.availability(
+                        ManagedEvent()
+                    )
+
+                self.assertFalse(available)
+                self.assertEqual(
+                    reason, "astrbot_call_contract_unverified"
+                )
+
     async def test_search_uses_managed_tool_instance(self):
         tool = FakeManagedTool(active=True)
         manager = FakeToolManager(tool=tool)
@@ -2477,14 +2576,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(available)
         self.assertEqual(reason, "astrbot_context_missing")
 
-    async def test_unverified_environment_is_unavailable(self):
-        try:
-            import astrbot  # type: ignore
-            if getattr(astrbot, "__version__", "") in {"4.29.4"}:
-                self.skipTest("AstrBot 4.29.4 已安装，契约适配器可用")
-        except Exception:
-            pass
-
+    async def test_missing_contract_modules_are_unavailable(self):
         class Cfg(dict):
             pass
 
@@ -2498,17 +2590,398 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 })
 
+            def get_llm_tool_manager(self):
+                return FakeToolManager()
+
         class Event:
             unified_msg_origin = "webchat:test"
 
-        backend = AstrBotSearchBackend(context=Context())
-        available, reason = await backend.availability(Event())
+        astrbot = types.ModuleType("astrbot")
+        astrbot.__version__ = "9.9.9"
+        with patch.dict(sys.modules, {
+            "astrbot": astrbot,
+            "astrbot.core.agent.run_context": None,
+            "astrbot.core.astr_agent_context": None,
+        }):
+            backend = AstrBotSearchBackend(context=Context())
+            available, reason = await backend.availability(Event())
+
         self.assertFalse(available)
-        self.assertIn(reason, {
-            "astrbot_contract_unavailable",
-            "astrbot_version_unverified",
-        })
+        self.assertEqual(reason, "astrbot_contract_unavailable")
+
+
+class NoResultsStatusTests(unittest.IsolatedAsyncioTestCase):
+    """正常零结果必须与网络/服务失败区分（口径 B）。"""
+
+    async def test_all_no_results_is_no_results_not_failed(self):
+        first = FakeBackend("api", status="no_results", reason="empty_results")
+        second = FakeBackend("web", status="no_results", reason="unparsed_results")
+        svc = fake_service(
+            {"api": first, "web": second}, mode="api", fallback_enabled=True
+        )
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(
+            [a["status"] for a in result["attempted"]],
+            ["no_results", "no_results"],
+        )
+        self.assertEqual(result["status"], "no_results")
+        diagnostic = format_search_diagnostic(result)
+        self.assertIn("无有效结果", diagnostic)
+        await svc.close()
+
+    async def test_no_results_plus_real_failure_is_failed(self):
+        first = FakeBackend("api", status="no_results", reason="empty_results")
+        second = FakeBackend("web", status="failed", reason="network_error")
+        svc = fake_service(
+            {"api": first, "web": second}, mode="api", fallback_enabled=True
+        )
+        result = await svc.search_game_info("游戏")
+        # 有真实失败（network_error）时整体仍必须是 failed。
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "network_error")
+        await svc.close()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchGroupPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """三组有序策略：按保存顺序尝试、跳过未勾选、首个有效结果即停止。"""
+
+    def _service(self, groups, backends, enabled=True):
+        return SearchService(
+            enabled=enabled,
+            groups=groups,
+            timeout_ms=2000,
+            backends=backends,
+        )
+
+    async def test_saved_order_overrides_backend_catalog_order(self):
+        astrbot = FakeBackend("astrbot", results=[item(source="astrbot")])
+        api = FakeBackend("api", results=[item(source="tavily")])
+        web = FakeBackend("web", results=[item(source="bing")])
+        svc = self._service(["web", "astrbot", "api"], {
+            "astrbot": astrbot, "api": api, "web": web,
+        })
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(len(web.calls), 1)
+        self.assertEqual(len(astrbot.calls), 0)
+        self.assertEqual(len(api.calls), 0)
+        await svc.close()
+
+    async def test_disabled_groups_are_never_called(self):
+        astrbot = FakeBackend("astrbot", results=[item(source="astrbot")])
+        api = FakeBackend("api", results=[item(source="tavily")])
+        web = FakeBackend("web", results=[item(source="bing")])
+        svc = self._service(["web"], {
+            "astrbot": astrbot, "api": api, "web": web,
+        })
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["effective_backend"], "web")
+        self.assertEqual(len(astrbot.calls), 0)
+        self.assertEqual(len(api.calls), 0)
+        await svc.close()
+
+    async def test_first_valid_result_stops_later_groups(self):
+        api = FakeBackend("api", results=[item(source="tavily")])
+        web = FakeBackend("web", results=[item(source="bing")])
+        svc = self._service(["api", "web"], {"api": api, "web": web})
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["effective_backend"], "api")
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(len(web.calls), 0)
+        await svc.close()
+
+    async def test_astrbot_group_calls_official_then_plugin(self):
+        first = FakeBackend("astrbot", results=[item(source="astrbot")])
+        plugin = FakeBackend("anysearch", results=[item(source="anysearch")])
+        svc = self._service(["astrbot"], {
+            "astrbot": first, "anysearch": plugin,
+        })
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["effective_backend"], "astrbot")
+        self.assertEqual(len(plugin.calls), 0)
+        await svc.close()
+
+    async def test_astrbot_group_falls_back_to_plugin_only(self):
+        official = FakeBackend(
+            "astrbot", status="failed", reason="astrbot_search_error",
+        )
+        plugin = FakeBackend("anysearch", results=[item(source="anysearch")])
+        svc = self._service(["astrbot"], {
+            "astrbot": official, "anysearch": plugin,
+        })
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["effective_backend"], "anysearch")
+        self.assertEqual(len(plugin.calls), 1)
+        await svc.close()
+
+    async def test_master_off_makes_zero_search_calls(self):
+        backend = FakeBackend("astrbot", results=[item(source="astrbot")])
+        svc = self._service(["astrbot"], {"astrbot": backend}, enabled=False)
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(len(backend.calls), 0)
+        await svc.close()
+
+    async def test_all_groups_unchecked_makes_zero_search_calls(self):
+        backend = FakeBackend("astrbot", results=[item(source="astrbot")])
+        svc = self._service([], {"astrbot": backend})
+        result = await svc.search_game_info("游戏")
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["mode"], "off")
+        self.assertEqual(len(backend.calls), 0)
+        await svc.close()
+
+    def test_groups_from_config_uses_saved_order_and_enabled(self):
+        groups = search_groups_from_config({
+            "enabled": True,
+            "mode": "auto",
+            "mode_order": ["web", "astrbot", "api"],
+            "mode_enabled": ["astrbot", "web"],
+        })
+        self.assertEqual(groups, ["web", "astrbot"])
+        # 全部未勾选必须是空列表，不能被旧 mode 回填成三组。
+        self.assertEqual(search_groups_from_config({
+            "enabled": True,
+            "mode": "auto",
+            "mode_order": ["astrbot", "api", "web"],
+            "mode_enabled": [],
+        }), [])
+        self.assertEqual(search_groups_from_config({
+            "enabled": False,
+            "mode_order": ["astrbot", "api", "web"],
+            "mode_enabled": ["astrbot"],
+        }), [])
+
+
+class MaterialBlockTests(unittest.TestCase):
+    def test_material_block_has_title_source_link_and_sentence_snippet(self):
+        block = build_material_block([
+            {
+                "title": "星露谷物语 玩法",
+                "url": "https://example.com/a",
+                "snippet": "第一句介绍。第二句讲平台。第三句讲节奏。第四句很长" * 8,
+                "source": "bing",
+            },
+        ], max_chars=1000, max_items=6, snippet_chars=120)
+        self.assertIn("[bing] 星露谷物语 玩法", block)
+        self.assertIn("链接：https://example.com/a", block)
+        self.assertIn("片段：", block)
+        # 片段按句子截断：保留完整句子，不出现半句。
+        snippet = block.split("片段：", 1)[1].strip()
+        self.assertTrue(snippet.endswith("。"), snippet)
+        self.assertLessEqual(len(snippet), 120)
+
+    def test_material_block_limits_items_and_rotates_sources(self):
+        results = []
+        for index in range(8):
+            results.append({
+                "title": f"T{index}",
+                "url": f"https://example.com/{index}",
+                "snippet": f"内容{index}。",
+                "source": "bing" if index % 2 == 0 else "baidu",
+            })
+        block = build_material_block(
+            results, max_chars=3000, max_items=4, snippet_chars=200
+        )
+        self.assertEqual(block.count("链接："), 4)
+        # 两个来源交替进入，不会只剩单一来源。
+        self.assertIn("[bing]", block)
+        self.assertIn("[baidu]", block)
+
+    def test_material_block_respects_total_budget(self):
+        results = [{
+            "title": "标题" * 20,
+            "url": "https://example.com/very/long/path/" + "x" * 100,
+            "snippet": "句子。" * 200,
+            "source": "bing",
+        } for _ in range(6)]
+        block = build_material_block(
+            results, max_chars=800, max_items=6, snippet_chars=400
+        )
+        self.assertLessEqual(len(block), 800)
+
+    def test_oversized_first_item_is_skipped_before_counting(self):
+        # 审查回归：预算 1,000 字、最多 1 条时，首条链接过长放不下，
+        # 必须跳过它继续试下一条，而不是返回空块让调用方回退到旧摘要。
+        long_url = "https://example.com/" + "y" * 1200
+        block = build_material_block([
+            {
+                "title": "放不下的长链接",
+                "url": long_url,
+                "snippet": "长链接摘要。",
+                "source": "bing",
+            },
+            {
+                "title": "能放下的短条目",
+                "url": "https://example.com/short",
+                "snippet": "短条目摘要。",
+                "source": "baidu",
+            },
+        ], max_chars=1000, max_items=1, snippet_chars=400)
+        self.assertIn("能放下的短条目", block)
+        self.assertNotIn("放不下的长链接", block)
+        self.assertEqual(block.count("链接："), 1)
+        self.assertLessEqual(len(block), 1000)
+
+    def test_game_search_queries_cover_platform_and_experience(self):
+        queries = game_search_queries("星露谷物语")
+        self.assertEqual(len(queries), 2)
+        self.assertIn("首发平台", queries[0])
+        self.assertIn("玩法机制", queries[0])
+        self.assertIn("体验评价", queries[1])
+        self.assertIn("剧情", queries[1])
+
+
+class WebTwoQueryTests(unittest.IsolatedAsyncioTestCase):
+    BING_ONE = (
+        '<html><body><ol><li class="b_algo"><h2>'
+        '<a href="https://example.com/bing-platform">Bing Platform</a></h2>'
+        '<p>平台与玩法摘要</p></li></ol></body></html>'
+    )
+    BAIDU_ONE = (
+        '<html><body><div class="result c-container">'
+        '<h3><a href="https://example.com/baidu-review">Baidu Review</a></h3>'
+        '<div class="c-abstract">体验与剧情摘要</div></div></body></html>'
+    )
+
+    def _service(self, handler):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.aclose)
+        svc = SearchService(
+            mode="web", timeout_ms=2000, result_count=3, web_client=client
+        )
+        self.addAsyncCleanup(svc.close)
+        return svc
+
+    async def test_web_group_issues_two_focused_queries(self):
+        queries = []
+
+        async def handler(request):
+            queries.append(
+                request.url.params.get("q") or request.url.params.get("wd")
+            )
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_ONE)
+            return httpx.Response(200, text=self.BAIDU_ONE)
+
+        result = await self._service(handler).search_game_info("星露谷物语")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(any("首发平台" in query for query in queries), queries)
+        self.assertTrue(any("体验评价" in query for query in queries), queries)
+        # 两路查询 × 两个来源 = 4 次请求，共享同一份超时预算。
+        self.assertEqual(len(queries), 4)
+        urls = {item["url"] for item in result["results"]}
+        self.assertIn("https://example.com/bing-platform", urls)
+        self.assertIn("https://example.com/baidu-review", urls)
+
+    async def test_two_queries_dedupe_same_url(self):
+        async def handler(request):
+            if request.url.host == "www.bing.com":
+                return httpx.Response(200, text=self.BING_ONE)
+            return httpx.Response(200, text=self.BAIDU_ONE)
+
+        result = await self._service(handler).search_game_info("星露谷物语")
+        urls = [item["url"] for item in result["results"]]
+        self.assertEqual(len(urls), len(set(urls)))
+
+
+class WebCoverageAndBudgetTests(unittest.IsolatedAsyncioTestCase):
+    def _service(self, handler, result_count=4):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.aclose)
+        svc = SearchService(
+            mode="web",
+            timeout_ms=2000,
+            result_count=result_count,
+            web_client=client,
+        )
+        self.addAsyncCleanup(svc.close)
+        return svc
+
+    @staticmethod
+    def _html(items):
+        return (
+            '<html><body><ol>'
+            + ''.join(
+                f'<li class="b_algo"><h2><a href="https://example.com/{x}">'
+                f'{x}</a></h2><p>摘要</p></li>'
+                for x in items
+            )
+            + '</ol></body></html>'
+        )
+
+    async def test_two_directions_cover_all_unique_items(self):
+        async def handler(request):
+            query = request.url.params.get("q") or ""
+            items = ["A", "B", "C"] if "首发平台" in query else ["B", "A", "D"]
+            return httpx.Response(200, text=self._html(items))
+
+        result = await self._service(handler).search_game_info("游戏")
+        titles = [item["title"] for item in result["results"]]
+        self.assertEqual(set(titles), {"A", "B", "C", "D"})
+
+    async def test_small_cap_includes_both_query_directions(self):
+        async def handler(request):
+            query = request.url.params.get("q") or ""
+            items = ["A1"] if "首发平台" in query else ["B1"]
+            return httpx.Response(200, text=self._html(items))
+
+        result = await self._service(handler, result_count=2).search_game_info(
+            "游戏"
+        )
+        titles = [item["title"] for item in result["results"]]
+        self.assertEqual(len(titles), 2)
+        self.assertIn("A1", titles)
+        self.assertIn("B1", titles)
+
+    def test_long_link_never_exceeds_budget_and_keeps_later_items(self):
+        block = build_material_block([
+            {
+                "title": "超长链接",
+                "url": "https://example.com/" + "x" * 900,
+                "snippet": "内容。",
+                "source": "bing",
+            },
+            {
+                "title": "短素材",
+                "url": "https://example.com/short",
+                "snippet": "能被保留的短片段。",
+                "source": "baidu",
+            },
+        ], max_chars=1000, max_items=6, snippet_chars=400)
+        self.assertLessEqual(len(block), 1000)
+        self.assertIn("短素材", block)
+
+
+class MaterialDefinitionTests(unittest.TestCase):
+    def test_material_block_is_defined_once_and_respects_budget(self):
+        import inspect
+
+        import astrbot_plugin_onepercent_generator.search_service as ss
+
+        source = inspect.getsource(ss)
+        self.assertEqual(source.count("def build_material_block("), 1)
+        self.assertEqual(source.count("def _truncate_sentences("), 1)
+        block = ss.build_material_block([
+            {
+                "title": "超长链接",
+                "url": "https://example.com/" + "x" * 900,
+                "snippet": "内容。",
+                "source": "bing",
+            },
+            {
+                "title": "短素材",
+                "url": "https://example.com/short",
+                "snippet": "短片段。",
+                "source": "baidu",
+            },
+        ], max_chars=1000, max_items=6, snippet_chars=400)
+        self.assertLessEqual(len(block), 1000)
+        self.assertIn("短素材", block)

@@ -19,9 +19,11 @@ TIMEOUT_SECONDS = 120
 
 API_FORMAT_CHAT_COMPLETIONS = "chat_completions"
 API_FORMAT_RESPONSES = "responses"
+API_FORMAT_ANTHROPIC_MESSAGES = "anthropic_messages"
 SUPPORTED_API_FORMATS = {
     API_FORMAT_CHAT_COMPLETIONS,
     API_FORMAT_RESPONSES,
+    API_FORMAT_ANTHROPIC_MESSAGES,
 }
 
 # Responses API 的 incomplete_details.reason 到用户可理解提示的映射。
@@ -149,6 +151,23 @@ class AIClient:
         send_temperature 为 False 时，两种 API 格式都不发送 temperature，
         其余字段保持不变。
         """
+        if self.api_format == API_FORMAT_ANTHROPIC_MESSAGES:
+            base = self.base_url
+            url = (
+                f"{base}/messages"
+                if base.rstrip("/").endswith("/v1")
+                else f"{base}/v1/messages"
+            )
+            payload = {
+                "model": self.model,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+                "max_tokens": max_tokens,
+            }
+            if self.send_temperature:
+                payload["temperature"] = temperature
+            return url, payload
+
         if self.api_format == API_FORMAT_RESPONSES:
             payload = {
                 "model": self.model,
@@ -180,6 +199,17 @@ class AIClient:
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("Chat Completions 响应正文为空")
             return content
+
+        if self.api_format == API_FORMAT_ANTHROPIC_MESSAGES:
+            text_parts = []
+            for item in data.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        text_parts.append(text)
+            if not text_parts:
+                raise ValueError("Anthropic Messages 响应中没有可用文本")
+            return "\n".join(text_parts)
 
         # 部分兼容服务会直接返回 SDK 风格的 output_text。
         output_text = data.get("output_text")
@@ -371,7 +401,12 @@ class AIClient:
     def _extract_token_usage(self, data: dict) -> dict:
         """将不同 API 格式的 Token 统计归一化。"""
         usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         if self.api_format == API_FORMAT_RESPONSES:
+            prompt_tokens = usage.get("input_tokens", 0)
+            completion_tokens = usage.get("output_tokens", 0)
+        elif self.api_format == API_FORMAT_ANTHROPIC_MESSAGES:
             prompt_tokens = usage.get("input_tokens", 0)
             completion_tokens = usage.get("output_tokens", 0)
         else:
@@ -400,7 +435,9 @@ class AIClient:
                 "model": str,
                 "api_format": str,
                 "duration_ms": int,
-                "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+                "token_usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int},
+                "finish_reason": str,
+                "truncated": bool
             }
         """
         return await self._call_ai(
@@ -446,10 +483,17 @@ class AIClient:
             )
 
         client = await self._get_client()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        if self.api_format == API_FORMAT_ANTHROPIC_MESSAGES:
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
         url, payload = self._build_request(
             system_prompt,
             user_prompt,
@@ -480,10 +524,26 @@ class AIClient:
             duration_ms = int((time.time() - start_time) * 1000)
 
             token_usage = self._extract_token_usage(data)
+            usage_raw = data.get("usage")
+            token_available = isinstance(usage_raw, dict) and bool(usage_raw)
+            finish_reason = ""
+            truncated = False
+            if self.api_format == API_FORMAT_CHAT_COMPLETIONS:
+                choices = data.get("choices")
+                if isinstance(choices, list) and choices:
+                    choice = choices[0]
+                    if isinstance(choice, dict):
+                        raw_reason = choice.get("finish_reason")
+                        if isinstance(raw_reason, str):
+                            candidate = raw_reason.strip().lower()
+                            if candidate in {"stop", "length", "content_filter"}:
+                                finish_reason = candidate
+                                truncated = candidate == "length"
 
             logger.info(
                 f"[小作文生成器] AI 响应成功，长度: {len(content)} 字符，"
-                f"耗时: {duration_ms}ms，tokens: {token_usage['total_tokens']}"
+                f"耗时: {duration_ms}ms，tokens: {token_usage['total_tokens']}，"
+                f"finish_reason: {finish_reason or 'unknown'}"
             )
             return {
                 "content": content,
@@ -491,6 +551,9 @@ class AIClient:
                 "api_format": self.api_format,
                 "duration_ms": duration_ms,
                 "token_usage": token_usage,
+                "token_available": token_available,
+                "finish_reason": finish_reason,
+                "truncated": truncated,
             }
 
         except httpx.TimeoutException:
@@ -527,6 +590,17 @@ class AIClient:
         except AIClientError:
             raise
 
+        except httpx.RequestError as e:
+            msg = (
+                f"AI 连接失败: {type(e).__name__} "
+                f"{self.model} @ {self.base_url}"
+            )
+            logger.error("[小作文生成器] %s", msg)
+            raise AIClientAPIError(
+                msg,
+                "❌ 无法连接模型服务，请检查 Base URL、网络或服务状态",
+            )
+
         except Exception as e:
             # 不拼接异常原文：响应体解析等异常可能携带上游数据。
             msg = f"AI 调用异常: {type(e).__name__}"
@@ -551,7 +625,7 @@ class AIClient:
             }
 
         try:
-            await self._call_ai(
+            result = await self._call_ai(
                 system_prompt="你是一个连接测试助手。",
                 user_prompt="请回复'连接正常'四个字",
                 temperature=0,
@@ -565,6 +639,8 @@ class AIClient:
                     f"API 格式：{self.api_format}"
                 ),
                 "model": self.model,
+                "token_usage": result.get("token_usage"),
+                "token_available": bool(result.get("token_available")),
             }
         except AIClientError as e:
             return {

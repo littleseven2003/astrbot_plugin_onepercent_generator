@@ -1,0 +1,8 @@
+{
+  "views": {
+    "config-center": {
+      "title": "Essay Generator",
+      "description": "Usage, models, search, rate limits, sessions, and administrators."
+    }
+  }
+}

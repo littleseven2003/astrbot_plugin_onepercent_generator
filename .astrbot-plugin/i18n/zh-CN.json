@@ -1,0 +1,8 @@
+{
+  "views": {
+    "config-center": {
+      "title": "小作文生成器",
+      "description": "用量状态、模型、搜索、频率、会话与管理员统一配置。"
+    }
+  }
+}
